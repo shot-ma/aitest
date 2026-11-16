@@ -103,6 +103,7 @@ async function route() {
     fill(main, appHeader(app, tab), content);
     if (tab === 'settings') await viewSettings(app, content);
     else if (tab === 'summary') viewSummary(app, content);
+    else if (tab === 'calendar') await viewCalendar(app, content);
     else {
       await viewRecords(app, content);
       // #/app/1/record/5 の形式（通知や参照項目のリンク）ならそのレコードを開く
@@ -306,7 +307,8 @@ function appHeader(app, tab) {
           toast(app.following ? '通知を停止しました' : '通知を受け取ります'); route();
         },
       }, app.following ? '🔔 通知を受け取り中' : '🔕 通知を受け取る')),
-    h('nav', { class: 'tabs' }, link('records', 'レコード一覧'), link('summary', '集計'), app.role === 'manager' && link('settings', '設定')));
+    h('nav', { class: 'tabs' }, link('records', 'レコード一覧'),
+      app.fields.some(f => f.type === 'date') && link('calendar', 'カレンダー'), link('summary', '集計'), app.role === 'manager' && link('settings', '設定')));
 }
 
 // ---------- アプリ一覧 ----------
@@ -551,11 +553,12 @@ function fieldInput(f, value, ref) {
   }
 }
 
-function recordDialog(app, record, onDone) {
+// preset: 新規追加時にあらかじめ入れておく値（項目ID → 値）
+function recordDialog(app, record, onDone, preset = {}) {
   const canEdit = app.role !== 'viewer'; // 閲覧のみの人には入力欄を無効にして表示だけする
   const getters = {}, errorEls = {};
   const body = app.fields.map(f => {
-    const [el, get] = fieldInput(f, record?.data[f.id], record?.refs[f.id]);
+    const [el, get] = fieldInput(f, record ? record.data[f.id] : preset[f.id], record?.refs[f.id]);
     getters[f.id] = get;
     errorEls[f.id] = h('div', { class: 'error' });
     return h('div', { class: 'form-field' },
@@ -621,6 +624,77 @@ function commentsSection(app, record, onChange) {
           catch (err) { toast(err.message); }
         },
       }, 'コメントする')));
+}
+
+// ---------- カレンダー ----------
+
+const calState = {}; // アプリごとの表示状態（基準にする日付項目・表示中の年月）
+const pad = n => String(n).padStart(2, '0');
+const ymd = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
+
+async function viewCalendar(app, root) {
+  const dateFields = app.fields.filter(f => f.type === 'date');
+  if (!dateFields.length) {
+    fill(root, h('div', { class: 'panel empty' }, 'カレンダー表示には日付項目が必要です。'));
+    return;
+  }
+  const now = new Date();
+  const st = calState[app.id] ||= { field: dateFields[0].id, year: now.getFullYear(), month: now.getMonth() };
+  if (!dateFields.some(f => f.id === st.field)) st.field = dateFields[0].id;
+  const reload = () => viewCalendar(app, root);
+  const canEdit = app.role !== 'viewer';
+  // レコードの見出しには、最初の1行文字列の項目を使う（無ければ No.）
+  const titleField = app.fields.find(f => f.type === 'text');
+  const title = r => (titleField && r.data[titleField.id]) || `No.${r.id}`;
+
+  const lastDay = new Date(st.year, st.month + 1, 0).getDate();
+  const q = new URLSearchParams({ per_page: 500, sort: 'id', order: 'asc' });
+  q.set(`f_${st.field}_from`, ymd(st.year, st.month, 1));
+  q.set(`f_${st.field}_to`, ymd(st.year, st.month, lastDay));
+  const res = await api('GET', `/api/apps/${app.id}/records?${q}`);
+  const byDay = {};
+  for (const r of res.records) (byDay[r.data[st.field]] ||= []).push(r);
+
+  const move = d => { const t = new Date(st.year, st.month + d, 1); st.year = t.getFullYear(); st.month = t.getMonth(); reload(); };
+  const today = ymd(now.getFullYear(), now.getMonth(), now.getDate());
+  const cells = [];
+  for (let i = 0; i < new Date(st.year, st.month, 1).getDay(); i++) cells.push(h('div', { class: 'cal-cell blank' }));
+  for (let d = 1; d <= lastDay; d++) {
+    const key = ymd(st.year, st.month, d);
+    const items = byDay[key] || [];
+    const dow = new Date(st.year, st.month, d).getDay();
+    const list = h('div', { class: 'cal-items' });
+    // 多い日は3件まで表示し、残りは「他 N 件」で展開する
+    const draw = all => fill(list,
+      (all ? items : items.slice(0, 3)).map(r => h('button', {
+        class: 'cal-item', title: title(r), onclick: () => recordDialog(app, r, reload),
+      }, title(r))),
+      !all && items.length > 3 && h('button', { class: 'cal-more', onclick: () => draw(true) }, `他 ${items.length - 3} 件`));
+    draw(false);
+    cells.push(h('div', { class: 'cal-cell' + (key === today ? ' today' : '') + (dow === 0 ? ' sun' : dow === 6 ? ' sat' : '') },
+      h('div', { class: 'cal-day' }, h('span', {}, String(d)),
+        canEdit && h('button', {
+          class: 'cal-add', title: `${st.month + 1}月${d}日にレコードを追加`, 'aria-label': `${st.month + 1}月${d}日にレコードを追加`,
+          onclick: () => recordDialog(app, null, reload, { [st.field]: key }),
+        }, '＋')),
+      list));
+  }
+
+  fill(root,
+    h('div', { class: 'row', style: 'margin-top:14px' },
+      h('button', { class: 'icon', 'aria-label': '前の月', onclick: () => move(-1) }, '‹'),
+      h('strong', { class: 'cal-title' }, `${st.year}年${st.month + 1}月`),
+      h('button', { class: 'icon', 'aria-label': '次の月', onclick: () => move(1) }, '›'),
+      h('button', { onclick: () => { st.year = now.getFullYear(); st.month = now.getMonth(); reload(); } }, '今月'),
+      h('span', { class: 'spacer' }),
+      dateFields.length > 1 && h('label', {}, '日付項目 ', h('select', {
+        value: String(st.field), onchange: e => { st.field = Number(e.target.value); reload(); },
+      }, dateFields.map(f => h('option', { value: String(f.id) }, f.label)))),
+      h('span', { class: 'muted' }, `${res.total} 件`)),
+    h('div', { class: 'cal' },
+      ['日', '月', '火', '水', '木', '金', '土'].map((w, i) => h('div', { class: 'cal-head' + (i === 0 ? ' sun' : i === 6 ? ' sat' : '') }, w)),
+      cells),
+    res.total > res.records.length && h('div', { class: 'muted' }, `この月は件数が多いため、先頭 ${res.records.length} 件だけを表示しています。`));
 }
 
 // ---------- 集計 ----------

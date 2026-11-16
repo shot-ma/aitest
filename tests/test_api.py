@@ -513,3 +513,17 @@ def test_permissions_on_files_and_lookups(client):
     # 参照先を見られない人は、そのアプリを参照する項目を作れない
     own = outsider.post("/api/apps", json={"name": "自分用"}).json()
     assert outsider.put(f"/api/apps/{own['id']}/fields", json={"fields": [lookup]}).status_code == 400
+
+
+def test_date_range_filter(client, inquiry):
+    app_id, ids = inquiry
+    for d in ("2026-10-31", "2026-11-01", "2026-11-30", "2026-12-01"):
+        add(client, app_id, ids, 件名=d, 受付日=d, 状況="未対応")
+    add(client, app_id, ids, 件名="完了分", 受付日="2026-11-15", 状況="完了")
+    key = f"f_{ids['受付日']}"
+    get = lambda **p: sorted(r["data"][ids["件名"]] for r in client.get(
+        f"/api/apps/{app_id}/records", params=p).json()["records"])
+    assert get(**{f"{key}_from": "2026-11-01", f"{key}_to": "2026-11-30"}) == ["2026-11-01", "2026-11-30", "完了分"]
+    assert get(**{f"{key}_from": "2026-12-01"}) == ["2026-12-01"]
+    # ほかの絞り込みと組み合わせられる
+    assert get(**{f"{key}_from": "2026-11-01", f"{key}_to": "2026-11-30", f"f_{ids['状況']}": "完了"}) == ["完了分"]

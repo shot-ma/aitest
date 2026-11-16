@@ -200,3 +200,23 @@ body.signed-in .topbar #bell, body.signed-in .topbar #userBtn { display: inline-
 fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; }
 .member { padding: 6px 0; border-bottom: 1px solid var(--line); }
 .member-name { flex: 1; min-width: 160px; }
+
+/* カレンダー */
+.cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); margin-top: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.cal-title { font-size: 1.1rem; min-width: 7.5em; text-align: center; }
+.cal-head { padding: 6px; text-align: center; font-size: .85rem; color: var(--muted); border-bottom: 1px solid var(--line); }
+.cal-cell { min-height: 104px; padding: 4px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-width: 0; }
+.cal-cell:nth-child(7n) { border-right: 0; }
+.cal-cell.blank { background: var(--bg); }
+.cal-day { display: flex; justify-content: space-between; align-items: center; font-size: .85rem; padding: 0 2px 2px; }
+.cal-cell.today .cal-day span { background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 0 7px; font-weight: 700; }
+.sun { color: var(--danger); }
+.sat { color: #2563eb; }
+.cal-add { border: 0; background: none; padding: 0 5px; color: var(--muted); opacity: 0; }
+.cal-cell:hover .cal-add, .cal-add:focus-visible { opacity: 1; }
+.cal-item { display: block; width: 100%; text-align: left; border: 0; border-radius: 4px; background: var(--accent-soft); color: var(--ink); padding: 1px 6px; margin-top: 2px; font-size: .82rem; overflow: hidden; text-overflow: ellipsis; }
+.cal-item:hover { outline: 1px solid var(--accent); }
+.cal-more { border: 0; background: none; padding: 0 4px; margin-top: 2px; font-size: .78rem; color: var(--accent); }
+@media (prefers-color-scheme: dark) { .sat { color: #7aa2ff; } }
+@media (hover: none) { .cal-add { opacity: 1; } }
+@media (max-width: 640px) { .cal-cell { min-height: 76px; padding: 2px; } .cal-item { font-size: .72rem; padding: 1px 3px; } }

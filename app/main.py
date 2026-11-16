@@ -618,10 +618,17 @@ def build_where(app_id: int, fields: list[dict], params) -> tuple[str, list]:
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         args.append(f"%{esc}%")
     for f in fields:
+        path = f'$."{f["id"]}"'  # 項目IDは整数なので SQL に埋め込んでも安全
+        if f["type"] == "date":
+            # 日付は範囲でも絞り込める（f_<項目ID>_from / _to。カレンダー表示で使う）
+            for suffix, op in (("from", ">="), ("to", "<=")):
+                d = params.get(f"f_{f['id']}_{suffix}")
+                if d:
+                    where.append(f"json_extract(data, '{path}') {op} ?")
+                    args.append(d)
         v = params.get(f"f_{f['id']}")
         if v in (None, ""):
             continue
-        path = f'$."{f["id"]}"'  # 項目IDは整数なので SQL に埋め込んでも安全
         if f["type"] == "multi":
             where.append(f"EXISTS (SELECT 1 FROM json_each(records.data, '{path}') "
                          "WHERE value = ?)")
@@ -1009,7 +1016,7 @@ def lookup_candidates(app_id: int, field_id: int, user: User, q: str = ""):
 @app.get("/api/apps/{app_id}/records")
 def list_records(app_id: int, request: Request, user: User, sort: str = "id",
                  order: str = "desc", page: int = 1, per_page: int = 20):
-    page, per_page = max(page, 1), min(max(per_page, 1), 200)
+    page, per_page = max(page, 1), min(max(per_page, 1), 500)
     with connect() as conn:
         get_app(conn, app_id, user)
         fields = get_fields(conn, app_id)
