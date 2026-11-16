@@ -664,3 +664,52 @@ def test_field_permissions(client, tmp_path):
     # 制限を外すと見えるようになる
     client.put(f"{base}/fields", json={"fields": [{**f, "access": "all", "user_ids": []} for f in fields]})
     assert tanaka.get(url).json()["data"][salary] == 5000000
+
+
+def test_field_edit_permissions(client, tmp_path):
+    """編集を制限した項目は、見えるが値を変えられない。"""
+    sato, tanaka = new_user(client, "sato", "佐藤"), new_user(client, "tanaka", "田中")
+    a = client.post("/api/apps", json={"name": "案件"}).json()
+    base = f"/api/apps/{a['id']}"
+    only_sato = {"edit_access": "restricted", "editor_ids": [sato.user_id]}
+    spec = [{"label": "案件名", "type": "text", "required": True},
+            {"label": "承認", "type": "select", "options": ["未", "済"], "required": True, **only_sato},
+            {"label": "稟議書", "type": "file", **only_sato}]
+    assert client.put(f"{base}/fields", json={"fields": [{**spec[0], "edit_access": "x"}]}).status_code == 400
+    assert client.put(f"{base}/fields", json={"fields": [{**spec[1], "editor_ids": [9999]}]}).status_code == 400
+    fields = client.put(f"{base}/fields", json={"fields": spec}).json()
+    assert fields[1]["edit_access"] == "restricted" and fields[1]["editor_ids"] == [sato.user_id]
+    title, approval, doc = (str(f["id"]) for f in fields)
+
+    # アプリ情報: 編集できるかどうかだけを返し、誰が編集できるかの設定は管理者にだけ返す
+    editable = lambda who: [f["editable"] for f in who.get(base).json()["fields"]]
+    assert editable(client) == [True, True, True]
+    assert editable(sato) == [True, True, True]
+    assert editable(tanaka) == [True, False, False]
+    assert "editor_ids" not in tanaka.get(base).json()["fields"][1]
+    assert "editor_ids" in client.get(base).json()["fields"][1]
+
+    up = sato.post(f"{base}/fields/{doc}/files", files={"file": ("稟議.txt", b"doc")}).json()
+    rec = sato.post(f"{base}/records", json={"data": {title: "導入", approval: "未", doc: [up["id"]]}}).json()
+    url = f"{base}/records/{rec['id']}"
+
+    # 閲覧のみの人: 値は見えるが、変更は無視されて今の値が保たれる
+    assert tanaka.get(url).json()["data"][approval] == "未"
+    assert tanaka.get(f"/api/files/{up['id']}").content == b"doc"
+    r = tanaka.put(url, json={"data": {title: "導入（改）", approval: "済", doc: []}})
+    assert r.status_code == 200
+    assert r.json()["data"] == {title: "導入（改）", approval: "未", doc: [{"id": up["id"], "name": "稟議.txt", "size": 3}]}
+    assert tanaka.put(url, json={"data": {title: "導入（改）"}}).json()["data"][approval] == "未"  # 送らなくても消えない
+    assert len(list((tmp_path / "uploads").iterdir())) == 1
+    assert tanaka.post(f"{base}/fields/{doc}/files", files={"file": ("a", b"a")}).status_code == 403
+    # 新規登録と CSV 取り込みでは空のままになる（必須でもエラーにしない）
+    new = tanaka.post(f"{base}/records", json={"data": {title: "新規", approval: "済"}})
+    assert new.status_code == 201 and approval not in new.json()["data"]
+    imp = tanaka.post(f"{base}/import", files={"file": ("a.csv", "案件名,承認\n取込,済\n".encode(), "text/csv")}).json()
+    assert imp == {"imported": 1, "errors": []}
+    assert client.get(f"{base}/records", params={f"f_{approval}": "済"}).json()["total"] == 0
+
+    # 編集を許可された人と管理者は変更できる。見える人には必須も効く
+    assert sato.put(url, json={"data": {title: "導入", approval: "済"}}).json()["data"][approval] == "済"
+    assert sato.post(f"{base}/records", json={"data": {title: "x"}}).status_code == 422
+    assert client.put(url, json={"data": {title: "導入", approval: "未"}}).json()["data"][approval] == "未"

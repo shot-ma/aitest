@@ -107,7 +107,13 @@ CREATE TABLE IF NOT EXISTS fields (
     options TEXT NOT NULL DEFAULT '[]',
     position INTEGER NOT NULL DEFAULT 0,
     config TEXT NOT NULL DEFAULT '{}',
-    access TEXT NOT NULL DEFAULT 'all'  -- all（アプリを見られる全員）/ restricted（指定ユーザーのみ閲覧可）
+    access TEXT NOT NULL DEFAULT 'all',  -- all（アプリを見られる全員）/ restricted（指定ユーザーのみ閲覧可）
+    edit_access TEXT NOT NULL DEFAULT 'all'  -- all（閲覧できる編集者全員）/ restricted（指定ユーザーのみ編集可）
+);
+CREATE TABLE IF NOT EXISTS field_editors (
+    field_id INTEGER NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (field_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS field_members (
     field_id INTEGER NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
@@ -205,6 +211,7 @@ CREATE INDEX IF NOT EXISTS idx_user_notifications ON user_notifications(user_id,
 MIGRATIONS = [
     ("fields", "config", "TEXT NOT NULL DEFAULT '{}'"),
     ("fields", "access", "TEXT NOT NULL DEFAULT 'all'"),
+    ("fields", "edit_access", "TEXT NOT NULL DEFAULT 'all'"),
     ("records", "created_by", "TEXT NOT NULL DEFAULT ''"),
     ("records", "updated_by", "TEXT NOT NULL DEFAULT ''"),
     ("records", "created_by_id", "INTEGER"),
@@ -307,6 +314,8 @@ class FieldIn(BaseModel):
     config: dict = {}
     access: str = "all"       # restricted なら user_ids の人とアプリ管理者だけが閲覧できる
     user_ids: list[int] = []
+    edit_access: str = "all"  # restricted なら editor_ids の人とアプリ管理者だけが編集できる
+    editor_ids: list[int] = []
 
 
 class AppIn(BaseModel):
@@ -422,8 +431,11 @@ def app_detail(conn, app_id: int, user: dict) -> dict:
                              (app_id, user["id"])).fetchone()
     a = get_app(conn, app_id, user)
     fields, _ = split_fields(a, user, get_fields(conn, app_id))
-    if a["role"] != "manager":  # 誰が閲覧できるかの設定は管理者にだけ返す
-        fields = [{k: v for k, v in f.items() if k not in ("access", "user_ids")} for f in fields]
+    # editable: このユーザーが値を変更できる項目か（画面で入力欄を無効にするために返す）
+    fields = [{**f, "editable": can_edit_field(a, user, f)} for f in fields]
+    if a["role"] != "manager":  # 誰が閲覧・編集できるかの設定は管理者にだけ返す
+        secret = ("access", "user_ids", "edit_access", "editor_ids")
+        fields = [{k: v for k, v in f.items() if k not in secret} for f in fields]
     return {**a, "fields": fields, "views": get_views(conn, a, user, fields),
             "following": bool(following)}
 
@@ -432,11 +444,13 @@ def get_fields(conn, app_id: int) -> list[dict]:
     """アプリの全項目（閲覧権限で絞る前）。user_ids は閲覧を許可されたユーザー。"""
     rows = conn.execute(
         "SELECT * FROM fields WHERE app_id = ? ORDER BY position, id", (app_id,)).fetchall()
-    members: dict[int, list[int]] = {}
-    for m in conn.execute("SELECT m.field_id, m.user_id FROM field_members m "
-                          "JOIN fields f ON f.id = m.field_id WHERE f.app_id = ?", (app_id,)):
-        members.setdefault(m["field_id"], []).append(m["user_id"])
-    return [{**field_row(r), "user_ids": members.get(r["id"], [])} for r in rows]
+    members: dict[str, dict[int, list[int]]] = {"field_members": {}, "field_editors": {}}
+    for table, found in members.items():
+        for m in conn.execute(f"SELECT m.field_id, m.user_id FROM {table} m "
+                              "JOIN fields f ON f.id = m.field_id WHERE f.app_id = ?", (app_id,)):
+            found.setdefault(m["field_id"], []).append(m["user_id"])
+    return [{**field_row(r), "user_ids": members["field_members"].get(r["id"], []),
+             "editor_ids": members["field_editors"].get(r["id"], [])} for r in rows]
 
 
 def split_fields(app: dict, user: dict, fields: list[dict]) -> tuple[list[dict], list[str]]:
@@ -448,6 +462,17 @@ def split_fields(app: dict, user: dict, fields: list[dict]) -> tuple[list[dict],
         return fields, []
     visible = [f for f in fields if f["access"] == "all" or user["id"] in f["user_ids"]]
     return visible, [str(f["id"]) for f in fields if f not in visible]
+
+
+def can_edit_field(app: dict, user: dict, f: dict) -> bool:
+    """閲覧できる項目について、値を変更できるか（アプリ自体の編集権限は別に確認する）。"""
+    return app["role"] == "manager" or f["edit_access"] == "all" or user["id"] in f["editor_ids"]
+
+
+def locked_keys(app: dict, user: dict, fields: list[dict]) -> list[str]:
+    """このユーザーが値を変更できない項目のキー（閲覧できない項目と、閲覧のみの項目）。"""
+    visible, hidden = split_fields(app, user, fields)
+    return hidden + [str(f["id"]) for f in visible if not can_edit_field(app, user, f)]
 
 
 def lookup_restricted(conn, cfg: dict, user: dict) -> bool:
@@ -660,9 +685,10 @@ def clean_fields(items: list[FieldIn]) -> list[FieldIn]:
             f.options = []
         if f.type != "lookup":
             f.config = {}
-        if f.access not in ("all", "restricted"):
-            raise HTTPException(400, f"「{f.label}」の閲覧できる人の設定が正しくありません")
+        if f.access not in ("all", "restricted") or f.edit_access not in ("all", "restricted"):
+            raise HTTPException(400, f"「{f.label}」の閲覧・編集できる人の設定が正しくありません")
         f.user_ids = list(dict.fromkeys(f.user_ids)) if f.access == "restricted" else []
+        f.editor_ids = list(dict.fromkeys(f.editor_ids)) if f.edit_access == "restricted" else []
     return items
 
 
@@ -698,7 +724,7 @@ def validate_record(conn, app_id: int, fields: list[dict], data: dict, user: dic
     for f in fields:
         key, t = str(f["id"]), f["type"]
         if key in hidden:
-            # 閲覧できない項目は編集もできない。更新時は今の値を保ち、新規登録時は空のままにする
+            # 閲覧できない項目と閲覧のみの項目は変更できない。更新時は今の値を保ち、新規登録時は空のままにする
             if old and key in old:
                 cleaned[key] = old[key]
             continue
@@ -1163,26 +1189,27 @@ def replace_fields(app_id: int, body: FieldsIn, user: User):
                 keep.add(f.id)
             if f.type == "lookup":
                 check_lookup(conn, f, existing.get(f.id), user)
-            if f.user_ids and conn.execute(
-                    f"SELECT COUNT(*) FROM users WHERE id IN ({marks(f.user_ids)})",
-                    f.user_ids).fetchone()[0] != len(f.user_ids):
+            ids = list({*f.user_ids, *f.editor_ids})
+            if ids and conn.execute(f"SELECT COUNT(*) FROM users WHERE id IN ({marks(ids)})",
+                                    ids).fetchone()[0] != len(ids):
                 raise HTTPException(400, f"「{f.label}」: 存在しないユーザーが含まれています")
             opts = json.dumps(f.options, ensure_ascii=False)
             config = json.dumps(f.config)
             if f.id is None:
                 f.id = conn.execute(
                     "INSERT INTO fields (app_id, label, type, required, options, position, "
-                    "config, access) VALUES (?,?,?,?,?,?,?,?)",
+                    "config, access, edit_access) VALUES (?,?,?,?,?,?,?,?,?)",
                     (app_id, f.label, f.type, int(f.required), opts, pos, config,
-                     f.access)).lastrowid
+                     f.access, f.edit_access)).lastrowid
             else:
                 conn.execute(
                     "UPDATE fields SET label = ?, required = ?, options = ?, position = ?, "
-                    "config = ?, access = ? WHERE id = ?",
-                    (f.label, int(f.required), opts, pos, config, f.access, f.id))
-            conn.execute("DELETE FROM field_members WHERE field_id = ?", (f.id,))
-            conn.executemany("INSERT INTO field_members (field_id, user_id) VALUES (?,?)",
-                             [(f.id, uid) for uid in f.user_ids])
+                    "config = ?, access = ?, edit_access = ? WHERE id = ?",
+                    (f.label, int(f.required), opts, pos, config, f.access, f.edit_access, f.id))
+            for table, ids in (("field_members", f.user_ids), ("field_editors", f.editor_ids)):
+                conn.execute(f"DELETE FROM {table} WHERE field_id = ?", (f.id,))
+                conn.executemany(f"INSERT INTO {table} (field_id, user_id) VALUES (?,?)",
+                                 [(f.id, uid) for uid in ids])
         for fid in existing.keys() - keep:
             remove_files(conn, "field_id = ?", [fid])
             conn.execute("DELETE FROM fields WHERE id = ?", (fid,))
@@ -1258,7 +1285,8 @@ def create_record(app_id: int, body: RecordIn, user: User):
         a = get_app(conn, app_id, user, "editor")
         fields = get_fields(conn, app_id)
         visible, hidden = split_fields(a, user, fields)
-        data = validate_record(conn, app_id, fields, body.data, user, hidden=hidden)
+        data = validate_record(conn, app_id, fields, body.data, user,
+                               hidden=locked_keys(a, user, fields))
         ts = now()
         rid = conn.execute(
             "INSERT INTO records (app_id, data, created_at, updated_at, created_by, updated_by, "
@@ -1279,7 +1307,7 @@ def update_record(app_id: int, record_id: int, body: RecordIn, user: User):
         fields = get_fields(conn, app_id)
         visible, hidden = split_fields(a, user, fields)
         data = validate_record(conn, app_id, fields, body.data, user, record_id,
-                               json.loads(old["data"]), hidden)
+                               json.loads(old["data"]), locked_keys(a, user, fields))
         conn.execute("UPDATE records SET data = ?, updated_at = ?, updated_by = ? WHERE id = ?",
                      (json.dumps(data, ensure_ascii=False), now(), name, record_id))
         sync_attachments(conn, record_id, fields, data)
@@ -1354,9 +1382,12 @@ async def upload_file(app_id: int, field_id: int, user: User, file: UploadFile =
     """ファイルを仮アップロードする。レコード保存時にそのレコードへ紐付けられる。"""
     with connect() as conn:
         a = get_app(conn, app_id, user, "editor")
-        if not any(f["id"] == field_id and f["type"] == "file"
-                   for f in split_fields(a, user, get_fields(conn, app_id))[0]):
+        f = next((f for f in split_fields(a, user, get_fields(conn, app_id))[0]
+                  if f["id"] == field_id and f["type"] == "file"), None)
+        if not f:
             raise HTTPException(404, "添付ファイル項目が見つかりません")
+        if not can_edit_field(a, user, f):
+            raise HTTPException(403, "この項目を編集する権限がありません")
     stored = uuid.uuid4().hex
     path, size = upload_dir() / stored, 0
     try:
@@ -1496,8 +1527,10 @@ async def import_csv(app_id: int, user: User, file: UploadFile = File(...)):
         a = get_app(conn, app_id, user, "editor")
         fields = get_fields(conn, app_id)
         visible, hidden = split_fields(a, user, fields)
-        # 添付ファイルは CSV では取り込めないので列を無視する。閲覧できない項目の列も無視する
-        cols = {f["label"]: f for f in visible if f["type"] != "file"}
+        # 添付ファイルは CSV では取り込めないので列を無視する。閲覧・編集できない項目の列も無視する
+        locked = locked_keys(a, user, fields)
+        cols = {f["label"]: f for f in visible
+                if f["type"] != "file" and str(f["id"]) not in locked}
         if not any(h in cols for h in header):
             raise HTTPException(400, "1行目にアプリの項目名と一致する列がありません")
         imported, errors = 0, []
@@ -1524,7 +1557,7 @@ async def import_csv(app_id: int, user: User, file: UploadFile = File(...)):
                     cell = hit["id"] if hit and not lookup_restricted(conn, f["config"], user) else -1
                 data[str(f["id"])] = cell
             try:
-                cleaned = validate_record(conn, app_id, fields, data, user, hidden=hidden)
+                cleaned = validate_record(conn, app_id, fields, data, user, hidden=locked)
             except HTTPException as e:
                 labels = {str(f["id"]): f["label"] for f in fields}
                 msg = "、".join(f"{labels[k]}: {m}" for k, m in e.detail["errors"].items())

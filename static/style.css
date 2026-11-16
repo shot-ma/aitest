@@ -228,3 +228,5 @@ fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; }
 .field-access { font-size: .9rem; color: var(--muted); gap: 6px 14px; }
 .field-access select { font-size: .9rem; padding: 3px 6px; }
 .field-access .pick { color: var(--ink); }
+.readonly-note { font-weight: 400; margin-left: 6px; }
+fieldset:disabled a.file { pointer-events: auto; }

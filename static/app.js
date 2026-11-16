@@ -682,8 +682,11 @@ function recordDialog(app, record, onDone, preset = {}) {
     const [el, get] = fieldInput(f, record ? record.data[f.id] : preset[f.id], record?.refs[f.id]);
     getters[f.id] = get;
     errorEls[f.id] = h('div', { class: 'error' });
+    const locked = canEdit && f.editable === false; // 見えるが変更できない項目
     return h('div', { class: 'form-field' },
-      h('div', { class: 'label' }, f.label, f.required && h('span', { class: 'req' }, '*')), el, errorEls[f.id]);
+      h('div', { class: 'label' }, f.label, f.required && !locked && h('span', { class: 'req' }, '*'),
+        locked && h('span', { class: 'muted readonly-note' }, '（閲覧のみ）')),
+      locked ? h('fieldset', { class: 'plain', disabled: true }, el) : el, errorEls[f.id]);
   });
   const dlg = openDialog({
     title: !record ? 'レコードを追加' : canEdit ? `レコード No.${record.id} を編集` : `レコード No.${record.id}`,
@@ -822,7 +825,7 @@ async function viewCalendar(app, root, view) {
     }, title(r))));
     cells.push(h('div', { class: 'cal-cell' + (key === today ? ' today' : '') + (dow === 0 ? ' sun' : dow === 6 ? ' sat' : '') },
       h('div', { class: 'cal-day' }, h('span', {}, String(d)),
-        canEdit && h('button', {
+        canEdit && dateFields.find(f => f.id === st.field).editable !== false && h('button', {
           class: 'cal-add', title: `${st.month + 1}月${d}日にレコードを追加`, 'aria-label': `${st.month + 1}月${d}日にレコードを追加`,
           onclick: () => recordDialog(app, null, reload, { [st.field]: key }),
         }, '＋')),
@@ -899,7 +902,7 @@ async function viewSettings(app, root) {
   const desc = h('input', { class: 'wide', value: app.description, maxLength: 500 });
   const icon = h('input', { value: app.icon, maxLength: 8, size: 4 });
   const directory = await api('GET', '/api/users/directory');
-  const draft = app.fields.map(f => ({ ...f, config: { ...f.config }, user_ids: [...f.user_ids], optionsText: f.options.join('\n') }));
+  const draft = app.fields.map(f => ({ ...f, config: { ...f.config }, user_ids: [...f.user_ids], editor_ids: [...f.editor_ids], optionsText: f.options.join('\n') }));
   const list = h('div');
 
   function renderFields() {
@@ -927,6 +930,17 @@ async function viewSettings(app, root) {
           h('input', {
             type: 'checkbox', checked: f.user_ids.includes(u.id),
             onchange: e => { f.user_ids = e.target.checked ? [...f.user_ids, u.id] : f.user_ids.filter(id => id !== u.id); },
+          }), ` ${u.display_name}`))),
+      // 項目ごとの編集権限。制限すると、指定した人とアプリ管理者以外は値を見られるが変更できない
+      h('div', { class: 'opts row field-access' },
+        h('label', {}, '編集できる人 ', h('select', {
+          value: f.edit_access, 'aria-label': `${f.label || '項目'} を編集できる人`,
+          onchange: e => { f.edit_access = e.target.value; renderFields(); },
+        }, h('option', { value: 'all' }, '閲覧できる編集者全員'), h('option', { value: 'restricted' }, '✏️ 指定したユーザーだけ'))),
+        f.edit_access === 'restricted' && directory.map(u => h('label', { class: 'pick' },
+          h('input', {
+            type: 'checkbox', checked: f.editor_ids.includes(u.id),
+            onchange: e => { f.editor_ids = e.target.checked ? [...f.editor_ids, u.id] : f.editor_ids.filter(id => id !== u.id); },
           }), ` ${u.display_name}`))),
       f.type === 'lookup' && h('div', { class: 'opts row' },
         h('label', {}, '参照先アプリ ', h('select', {
@@ -975,10 +989,10 @@ async function viewSettings(app, root) {
   fill(root, 
     h('div', { class: 'panel' },
       h('h2', {}, '項目の設定'),
-      h('div', { class: 'muted' }, 'レコードに入力する項目を定義します。項目を削除すると、その項目に入力済みの値も削除されます。「閲覧できる人」を制限した項目は、指定した人とこのアプリの管理者だけが閲覧・編集できます。'),
+      h('div', { class: 'muted' }, 'レコードに入力する項目を定義します。項目を削除すると、その項目に入力済みの値も削除されます。「閲覧できる人」を制限した項目は、指定した人とこのアプリの管理者だけが閲覧・編集できます。「編集できる人」だけを制限すると、ほかの人は値を見られますが変更できません。'),
       list,
       h('div', { class: 'row', style: 'margin-top:12px' },
-        h('button', { onclick: () => { draft.push({ label: '', type: 'text', required: false, optionsText: '', config: {}, access: 'all', user_ids: [] }); renderFields(); list.lastChild.querySelector('input').focus(); } }, '＋ 項目を追加'),
+        h('button', { onclick: () => { draft.push({ label: '', type: 'text', required: false, optionsText: '', config: {}, access: 'all', user_ids: [], edit_access: 'all', editor_ids: [] }); renderFields(); list.lastChild.querySelector('input').focus(); } }, '＋ 項目を追加'),
         h('span', { class: 'spacer' }),
         h('button', {
           class: 'primary',
@@ -987,7 +1001,7 @@ async function viewSettings(app, root) {
             if (removed.length && !confirm(`項目「${removed.map(f => f.label).join('、')}」と入力済みの値を削除します。よろしいですか？`)) return;
             try {
               await api('PUT', `/api/apps/${app.id}/fields`, {
-                fields: draft.map(f => ({ id: f.id ?? null, label: f.label, type: f.type, required: f.required, options: f.optionsText.split('\n'), config: f.config, access: f.access, user_ids: f.user_ids })),
+                fields: draft.map(f => ({ id: f.id ?? null, label: f.label, type: f.type, required: f.required, options: f.optionsText.split('\n'), config: f.config, access: f.access, user_ids: f.user_ids, edit_access: f.edit_access, editor_ids: f.editor_ids })),
               });
               toast('項目を保存しました'); route();
             } catch (err) { toast(err.message); }
