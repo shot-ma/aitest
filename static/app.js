@@ -628,7 +628,25 @@ function commentsSection(app, record, onChange) {
 
 // ---------- カレンダー ----------
 
-const calState = {}; // アプリごとの表示状態（基準にする日付項目・表示中の年月）
+const calState = {}; // アプリごとの表示状態（基準にする日付項目・表示項目・表示中の年月）
+// 選んだ日付項目と表示項目は、次に開いたときのためにブラウザへ保存する
+function calPrefs(appId, value) {
+  try {
+    if (value) localStorage.setItem('cal-' + appId, JSON.stringify(value));
+    else return JSON.parse(localStorage.getItem('cal-' + appId)) || {};
+  } catch { /* 保存できない環境では毎回既定値になる */ }
+  return {};
+}
+// カレンダーに出す文字列。項目の型に合わせて整形する
+function plainText(f, r) {
+  const v = r.data[f.id];
+  if (v == null || v === '') return '';
+  if (f.type === 'multi') return v.join('、');
+  if (f.type === 'check') return v ? `✓ ${f.label}` : '';
+  if (f.type === 'number') return Number(v).toLocaleString('ja-JP');
+  if (f.type === 'lookup') { const ref = r.refs[f.id]; return ref.label ?? (ref.restricted ? '（権限なし）' : '（削除済み）'); }
+  return String(v);
+}
 const pad = n => String(n).padStart(2, '0');
 const ymd = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
 
@@ -639,21 +657,31 @@ async function viewCalendar(app, root) {
     return;
   }
   const now = new Date();
-  const st = calState[app.id] ||= { field: dateFields[0].id, year: now.getFullYear(), month: now.getMonth() };
+  const titleFields = app.fields.filter(f => f.type !== 'file');
+  const st = calState[app.id] ||= { ...calPrefs(app.id), year: now.getFullYear(), month: now.getMonth() };
   if (!dateFields.some(f => f.id === st.field)) st.field = dateFields[0].id;
+  // 表示項目の既定は最初の1行文字列（無ければ先頭の項目）
+  if (!titleFields.some(f => f.id === st.title)) st.title = (app.fields.find(f => f.type === 'text') || titleFields[0]).id;
+  const choose = (key, value) => { st[key] = value; calPrefs(app.id, { field: st.field, title: st.title }); reload(); };
   const reload = () => viewCalendar(app, root);
   const canEdit = app.role !== 'viewer';
-  // レコードの見出しには、最初の1行文字列の項目を使う（無ければ No.）
-  const titleField = app.fields.find(f => f.type === 'text');
-  const title = r => (titleField && r.data[titleField.id]) || `No.${r.id}`;
+  const titleField = titleFields.find(f => f.id === st.title);
+  const title = r => plainText(titleField, r) || `No.${r.id}`; // 値が空のレコードは番号で表示
 
   const lastDay = new Date(st.year, st.month + 1, 0).getDate();
   const q = new URLSearchParams({ per_page: 500, sort: 'id', order: 'asc' });
   q.set(`f_${st.field}_from`, ymd(st.year, st.month, 1));
   q.set(`f_${st.field}_to`, ymd(st.year, st.month, lastDay));
-  const res = await api('GET', `/api/apps/${app.id}/records?${q}`);
+  // 件数が多くても全件出すため、ページを最後まで読む
+  const records = [];
+  for (let page = 1; ; page++) {
+    q.set('page', page);
+    const res = await api('GET', `/api/apps/${app.id}/records?${q}`);
+    records.push(...res.records);
+    if (records.length >= res.total || !res.records.length) break;
+  }
   const byDay = {};
-  for (const r of res.records) (byDay[r.data[st.field]] ||= []).push(r);
+  for (const r of records) (byDay[r.data[st.field]] ||= []).push(r);
 
   const move = d => { const t = new Date(st.year, st.month + d, 1); st.year = t.getFullYear(); st.month = t.getMonth(); reload(); };
   const today = ymd(now.getFullYear(), now.getMonth(), now.getDate());
@@ -663,14 +691,9 @@ async function viewCalendar(app, root) {
     const key = ymd(st.year, st.month, d);
     const items = byDay[key] || [];
     const dow = new Date(st.year, st.month, d).getDay();
-    const list = h('div', { class: 'cal-items' });
-    // 多い日は3件まで表示し、残りは「他 N 件」で展開する
-    const draw = all => fill(list,
-      (all ? items : items.slice(0, 3)).map(r => h('button', {
-        class: 'cal-item', title: title(r), onclick: () => recordDialog(app, r, reload),
-      }, title(r))),
-      !all && items.length > 3 && h('button', { class: 'cal-more', onclick: () => draw(true) }, `他 ${items.length - 3} 件`));
-    draw(false);
+    const list = h('div', { class: 'cal-items' }, items.map(r => h('button', {
+      class: 'cal-item', title: title(r), onclick: () => recordDialog(app, r, reload),
+    }, title(r))));
     cells.push(h('div', { class: 'cal-cell' + (key === today ? ' today' : '') + (dow === 0 ? ' sun' : dow === 6 ? ' sat' : '') },
       h('div', { class: 'cal-day' }, h('span', {}, String(d)),
         canEdit && h('button', {
@@ -688,13 +711,15 @@ async function viewCalendar(app, root) {
       h('button', { onclick: () => { st.year = now.getFullYear(); st.month = now.getMonth(); reload(); } }, '今月'),
       h('span', { class: 'spacer' }),
       dateFields.length > 1 && h('label', {}, '日付項目 ', h('select', {
-        value: String(st.field), onchange: e => { st.field = Number(e.target.value); reload(); },
+        value: String(st.field), onchange: e => choose('field', Number(e.target.value)),
       }, dateFields.map(f => h('option', { value: String(f.id) }, f.label)))),
-      h('span', { class: 'muted' }, `${res.total} 件`)),
+      h('label', {}, '表示項目 ', h('select', {
+        value: String(st.title), onchange: e => choose('title', Number(e.target.value)),
+      }, titleFields.map(f => h('option', { value: String(f.id) }, f.label)))),
+      h('span', { class: 'muted' }, `${records.length} 件`)),
     h('div', { class: 'cal' },
       ['日', '月', '火', '水', '木', '金', '土'].map((w, i) => h('div', { class: 'cal-head' + (i === 0 ? ' sun' : i === 6 ? ' sat' : '') }, w)),
-      cells),
-    res.total > res.records.length && h('div', { class: 'muted' }, `この月は件数が多いため、先頭 ${res.records.length} 件だけを表示しています。`));
+      cells));
 }
 
 // ---------- 集計 ----------
