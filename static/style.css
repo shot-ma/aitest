@@ -1,0 +1,171 @@
+:root {
+  --bg: #f4f5f2;
+  --surface: #ffffff;
+  --ink: #1d2a2c;
+  --muted: #667578;
+  --line: #dde2df;
+  --accent: #0f766e;
+  --accent-ink: #ffffff;
+  --accent-soft: #e0f1ee;
+  --danger: #b42318;
+  --radius: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131a1b;
+    --surface: #1c2526;
+    --ink: #e6ecea;
+    --muted: #94a3a3;
+    --line: #2e3b3c;
+    --accent: #2dd4bf;
+    --accent-ink: #06201d;
+    --accent-soft: #17403b;
+    --danger: #f97066;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.6 system-ui, "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif;
+}
+a { color: var(--accent); }
+h1 { font-size: 1.4rem; margin: 0; }
+h2 { font-size: 1.05rem; margin: 0 0 12px; }
+
+.topbar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 20px;
+}
+.brand { color: var(--ink); text-decoration: none; font-weight: 700; }
+.brand-mark { color: var(--accent); }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
+
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spacer { flex: 1; }
+.muted { color: var(--muted); font-size: .88rem; }
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-top: 16px;
+}
+
+button, .btn {
+  font: inherit;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+}
+button:hover, .btn:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.danger { color: var(--danger); }
+button.icon { padding: 4px 9px; }
+button:disabled { opacity: .4; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+input, select, textarea {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  max-width: 100%;
+}
+textarea { width: 100%; min-height: 90px; resize: vertical; }
+input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
+
+/* アプリ一覧 */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; margin-top: 18px; }
+.card {
+  display: block;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  color: var(--ink);
+  text-decoration: none;
+}
+.card:hover { border-color: var(--accent); }
+.card .icon { font-size: 1.9rem; line-height: 1; }
+.card .name { font-weight: 700; margin-top: 8px; }
+.empty { text-align: center; padding: 48px 16px; color: var(--muted); }
+
+/* タブ */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-top: 14px; }
+.tabs a { padding: 8px 14px; text-decoration: none; color: var(--muted); border-bottom: 2px solid transparent; }
+.tabs a.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* レコード一覧 */
+.table-wrap { overflow-x: auto; margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: .85rem; color: var(--muted); white-space: nowrap; cursor: pointer; user-select: none; }
+th:hover { color: var(--accent); }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--accent-soft); }
+tbody tr:last-child td { border-bottom: 0; }
+td { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.chip { display: inline-block; background: var(--accent-soft); border-radius: 999px; padding: 0 9px; font-size: .85rem; margin-right: 4px; }
+
+/* フォーム */
+.form-field { margin-bottom: 14px; }
+.form-field > label, .form-field > .label { display: block; font-weight: 600; font-size: .9rem; margin-bottom: 4px; }
+.req { color: var(--danger); margin-left: 4px; }
+.error { color: var(--danger); font-size: .85rem; margin-top: 3px; }
+.choices { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.choices label { font-weight: 400; }
+.wide { width: 100%; }
+
+dialog {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0;
+  width: min(620px, calc(100vw - 24px));
+  max-height: calc(100vh - 40px);
+}
+dialog::backdrop { background: rgba(0, 0, 0, .45); }
+dialog form { display: flex; flex-direction: column; max-height: calc(100vh - 42px); }
+.dlg-head { padding: 14px 18px; border-bottom: 1px solid var(--line); font-weight: 700; }
+.dlg-body { padding: 16px 18px; overflow-y: auto; }
+.dlg-foot { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; gap: 8px; }
+
+/* 項目設定 */
+.field-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.2fr) minmax(150px, 1fr) auto auto;
+  gap: 8px;
+  align-items: start;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.field-row .opts { grid-column: 1 / -1; }
+.field-row .opts textarea { min-height: 96px; }
+@media (max-width: 640px) { .field-row { grid-template-columns: 1fr 1fr; } }
+
+/* 集計 */
+.bar-row { display: grid; grid-template-columns: minmax(90px, 200px) 1fr auto; gap: 10px; align-items: center; padding: 5px 0; }
+.bar-track { background: var(--bg); border-radius: 4px; height: 20px; }
+.bar { background: var(--accent); height: 100%; border-radius: 4px; min-width: 2px; }
+.bar-val { font-variant-numeric: tabular-nums; min-width: 60px; text-align: right; }
+
+#toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: var(--ink); color: var(--bg);
+  padding: 8px 18px; border-radius: 999px;
+  opacity: 0; pointer-events: none; transition: opacity .2s;
+  max-width: calc(100vw - 32px);
+}
+#toast.show { opacity: 1; }
