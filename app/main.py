@@ -1,23 +1,31 @@
 """項目を自由に定義できるデータベースツール（カスタムアプリビルダー）。"""
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import uuid
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from urllib.parse import unquote
+from typing import Annotated
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 添付ファイル1件あたりの上限
 MAX_FILES_PER_FIELD = 10
+SESSION_DAYS = 14
+MAX_LOGIN_FAILURES = 5
+# アプリに対する権限の強さ。none < viewer（閲覧）< editor（編集）< manager（管理）
+RANK = {"none": 0, "viewer": 1, "editor": 2, "manager": 3}
 
 # 項目の型。choice 系は選択肢（options）が必須。
 FIELD_TYPES = {
@@ -87,7 +95,8 @@ CREATE TABLE IF NOT EXISTS apps (
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     icon TEXT NOT NULL DEFAULT '📋',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    default_role TEXT NOT NULL DEFAULT 'editor'  -- 個別指定のないユーザーの権限
 );
 CREATE TABLE IF NOT EXISTS fields (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +115,8 @@ CREATE TABLE IF NOT EXISTS records (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     created_by TEXT NOT NULL DEFAULT '',
-    updated_by TEXT NOT NULL DEFAULT ''
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_by_id INTEGER
 );
 -- 添付ファイル。record_id が NULL のものはアップロード済みで未保存の仮ファイル。
 CREATE TABLE IF NOT EXISTS attachments (
@@ -124,34 +134,60 @@ CREATE TABLE IF NOT EXISTS comments (
     record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
     author TEXT NOT NULL,
     body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    author_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',  -- admin（システム管理者）/ user
+    active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS followers (
-    app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
-    user_name TEXT NOT NULL,
-    PRIMARY KEY (app_id, user_name)
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS notifications (
+CREATE TABLE IF NOT EXISTS app_members (
+    app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    PRIMARY KEY (app_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS app_followers (
+    app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (app_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS user_notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipient TEXT NOT NULL,
-    actor TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
     record_id INTEGER,
     message TEXT NOT NULL,
     created_at TEXT NOT NULL,
     read INTEGER NOT NULL DEFAULT 0
 );
+-- ログイン導入前の、表示名ベースのフォローと通知は引き継げないので破棄する
+DROP TABLE IF EXISTS followers;
+DROP TABLE IF EXISTS notifications;
 CREATE INDEX IF NOT EXISTS idx_fields_app ON fields(app_id, position);
 CREATE INDEX IF NOT EXISTS idx_records_app ON records(app_id);
 CREATE INDEX IF NOT EXISTS idx_comments_record ON comments(record_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_record ON attachments(record_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient, id);
+CREATE INDEX IF NOT EXISTS idx_user_notifications ON user_notifications(user_id, id);
 """
 # 旧バージョンの DB に不足している列（テーブル, 列, 定義）
 MIGRATIONS = [
     ("fields", "config", "TEXT NOT NULL DEFAULT '{}'"),
     ("records", "created_by", "TEXT NOT NULL DEFAULT ''"),
     ("records", "updated_by", "TEXT NOT NULL DEFAULT ''"),
+    ("records", "created_by_id", "INTEGER"),
+    ("comments", "author_id", "INTEGER"),
+    ("apps", "default_role", "TEXT NOT NULL DEFAULT 'editor'"),
 ]
 
 _initialized: set[str] = set()
@@ -189,9 +225,53 @@ def now() -> str:
     return datetime.now().isoformat(sep=" ", timespec="seconds")
 
 
-def current_user(request: Request) -> str:
-    """画面で設定した表示名（認証ではない）。ヘッダーは URL エンコードで届く。"""
-    return unquote(request.headers.get("x-user-name", "")).strip()[:50] or "ゲスト"
+# ---------- 認証 ----------
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2 ** 14, r=8, p=1)
+    return f"{salt.hex()}:{digest.hex()}"
+
+
+def check_password(password: str, stored: str) -> bool:
+    salt = bytes.fromhex(stored.split(":")[0])
+    return hmac.compare_digest(hash_password(password, salt), stored)
+
+
+DUMMY_HASH = hash_password(secrets.token_hex(8))
+_login_failures: dict[str, tuple[int, datetime]] = {}  # ユーザーID → (連続失敗回数, ロック解除時刻)
+
+
+def sha(token: str) -> str:
+    """セッショントークンは DB にはハッシュだけを保存する。"""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def current_user(request: Request) -> dict:
+    token = request.cookies.get("session")
+    if token:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id "
+                "WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1",
+                (sha(token), now())).fetchone()
+        if row:
+            return dict(row)
+    raise HTTPException(401, "ログインが必要です")
+
+
+def admin_user(user: dict = Depends(current_user)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(403, "システム管理者だけが行える操作です")
+    return user
+
+
+User = Annotated[dict, Depends(current_user)]
+Admin = Annotated[dict, Depends(admin_user)]
+
+
+def public_user(u) -> dict:
+    return {k: u[k] for k in ("id", "username", "display_name", "role")}
 
 
 # ---------- モデル ----------
@@ -228,6 +308,47 @@ class FollowIn(BaseModel):
     follow: bool
 
 
+class AccountIn(BaseModel):
+    username: str
+    display_name: str
+    password: str
+
+
+class UserCreateIn(AccountIn):
+    role: str = "user"
+
+
+class UserUpdateIn(BaseModel):
+    display_name: str
+    role: str
+    active: bool
+    password: str = ""  # 空なら変更しない
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class ProfileIn(BaseModel):
+    display_name: str
+
+
+class PasswordIn(BaseModel):
+    current: str
+    new: str
+
+
+class MemberIn(BaseModel):
+    user_id: int
+    role: str
+
+
+class AccessIn(BaseModel):
+    default_role: str
+    members: list[MemberIn]
+
+
 # ---------- 共通処理 ----------
 
 def field_row(row) -> dict:
@@ -238,17 +359,35 @@ def field_row(row) -> dict:
     return d
 
 
-def get_app(conn, app_id: int) -> dict:
+def app_role(conn, app: dict, user: dict) -> str:
+    """ユーザーがそのアプリに対して持つ権限。全員向けの既定と個別指定の強い方になる。"""
+    if user["role"] == "admin":
+        return "manager"
+    row = conn.execute("SELECT role FROM app_members WHERE app_id = ? AND user_id = ?",
+                       (app["id"], user["id"])).fetchone()
+    return max(app["default_role"], row["role"] if row else "none", key=RANK.get)
+
+
+def get_app(conn, app_id: int, user: dict, need: str = "viewer") -> dict:
+    """アプリを取得し、need 以上の権限があることを確かめる。"""
     row = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
-    if not row:
+    role = app_role(conn, dict(row), user) if row else "none"
+    if role == "none":  # 閲覧できないアプリは存在自体を知らせない
         raise HTTPException(404, "アプリが見つかりません")
-    return dict(row)
+    if RANK[role] < RANK[need]:
+        raise HTTPException(403, "この操作を行う権限がありません")
+    return {**dict(row), "role": role}
 
 
-def app_detail(conn, app_id: int, user: str) -> dict:
-    following = conn.execute("SELECT 1 FROM followers WHERE app_id = ? AND user_name = ?",
-                             (app_id, user)).fetchone()
-    return {**get_app(conn, app_id), "fields": get_fields(conn, app_id),
+def can_view(conn, app_id, user: dict) -> bool:
+    row = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
+    return bool(row) and app_role(conn, dict(row), user) != "none"
+
+
+def app_detail(conn, app_id: int, user: dict) -> dict:
+    following = conn.execute("SELECT 1 FROM app_followers WHERE app_id = ? AND user_id = ?",
+                             (app_id, user["id"])).fetchone()
+    return {**get_app(conn, app_id, user), "fields": get_fields(conn, app_id),
             "following": bool(following)}
 
 
@@ -284,7 +423,7 @@ def ref_labels(conn, f: dict, ids) -> dict[int, str]:
     return {r["id"]: f"No.{r['id']}" if r["v"] in (None, "") else str(r["v"]) for r in rows}
 
 
-def present(conn, fields: list[dict], rows) -> list[dict]:
+def present(conn, fields: list[dict], rows, user: dict) -> list[dict]:
     """DB の行を API の形にする。参照項目の表示名は refs にまとめて付ける。"""
     recs = []
     for row in rows:
@@ -296,13 +435,18 @@ def present(conn, fields: list[dict], rows) -> list[dict]:
         if f["type"] != "lookup":
             continue
         key = str(f["id"])
-        labels = ref_labels(conn, f, {r["data"][key] for r in recs if key in r["data"]})
+        target = conn.execute("SELECT * FROM apps WHERE id = ?",
+                              (f["config"].get("app_id"),)).fetchone()
+        # 参照先アプリを閲覧できない人には、参照先の内容を見せない
+        restricted = bool(target) and app_role(conn, dict(target), user) == "none"
+        labels = {} if restricted else ref_labels(
+            conn, f, {r["data"][key] for r in recs if key in r["data"]})
         for r in recs:
             rid = r["data"].get(key)
             if rid is not None:
-                # 参照先が削除されている場合は label が None になる
+                # 参照先が削除されている場合と権限がない場合は label が None になる
                 r["refs"][key] = {"id": rid, "app_id": f["config"].get("app_id"),
-                                  "label": labels.get(rid)}
+                                  "label": labels.get(rid), "restricted": restricted}
     return recs
 
 
@@ -326,15 +470,17 @@ def sync_attachments(conn, record_id: int, fields: list[dict], cleaned: dict):
         remove_files(conn, "record_id = ?", [record_id])
 
 
-def notify(conn, app_id: int, record_id: int | None, actor: str, message: str, extra=()):
-    """アプリをフォロー中の人と extra に、操作した本人を除いて通知を作る。"""
-    rows = conn.execute("SELECT user_name FROM followers WHERE app_id = ?", (app_id,))
-    recipients = ({r["user_name"] for r in rows} | {u for u in extra if u}) - {actor}
+def notify(conn, app: dict, record_id: int | None, actor: dict, message: str, extra=()):
+    """アプリをフォロー中の人と extra（ユーザーID）に、操作した本人を除いて通知を作る。"""
+    rows = conn.execute("SELECT user_id FROM app_followers WHERE app_id = ?", (app["id"],))
+    ids = ({r["user_id"] for r in rows} | {u for u in extra if u}) - {actor["id"]}
     ts = now()
-    conn.executemany(
-        "INSERT INTO notifications (recipient, actor, app_id, record_id, message, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        [(u, actor, app_id, record_id, message, ts) for u in recipients])
+    for uid in ids:
+        u = conn.execute("SELECT * FROM users WHERE id = ? AND active = 1", (uid,)).fetchone()
+        if u and app_role(conn, app, dict(u)) != "none":  # 閲覧できなくなった人には送らない
+            conn.execute(
+                "INSERT INTO user_notifications (user_id, app_id, record_id, message, "
+                "created_at) VALUES (?,?,?,?,?)", (uid, app["id"], record_id, message, ts))
 
 
 def clean_fields(items: list[FieldIn]) -> list[FieldIn]:
@@ -361,7 +507,7 @@ def clean_fields(items: list[FieldIn]) -> list[FieldIn]:
     return items
 
 
-def check_lookup(conn, f: FieldIn, old: dict | None):
+def check_lookup(conn, f: FieldIn, old: dict | None, user: dict):
     """参照項目の設定（参照先アプリと表示に使う項目）を検証する。"""
     try:
         target, display_field = int(f.config["app_id"]), int(f.config["field_id"])
@@ -369,7 +515,7 @@ def check_lookup(conn, f: FieldIn, old: dict | None):
         raise HTTPException(400, f"「{f.label}」の参照先アプリと表示項目を選択してください")
     row = conn.execute("SELECT type FROM fields WHERE id = ? AND app_id = ?",
                        (display_field, target)).fetchone()
-    if not row or row["type"] not in LOOKUP_DISPLAY_TYPES:
+    if not row or row["type"] not in LOOKUP_DISPLAY_TYPES or not can_view(conn, target, user):
         raise HTTPException(400, f"「{f.label}」の表示項目が正しくありません")
     if old and old["config"].get("app_id") != target:
         raise HTTPException(400, f"「{f.label}」: 保存済みの項目の参照先アプリは変更できません")
@@ -386,8 +532,8 @@ ERROR_MESSAGES = {
 }
 
 
-def validate_record(conn, app_id: int, fields: list[dict], data: dict,
-                    record_id: int | None = None) -> dict:
+def validate_record(conn, app_id: int, fields: list[dict], data: dict, user: dict,
+                    record_id: int | None = None, old: dict | None = None) -> dict:
     """入力値を項目の型に合わせて検証・正規化する。エラー時は 422 を返す。"""
     cleaned, errors = {}, {}
     for f in fields:
@@ -444,9 +590,12 @@ def validate_record(conn, app_id: int, fields: list[dict], data: dict,
                 v = v.get("id") if isinstance(v, dict) else v
                 if isinstance(v, (bool, float)):
                     raise ValueError
-                v = int(v)
+                v, target = int(v), f["config"].get("app_id")
+                # 参照先を閲覧できない人は、今の値をそのまま残すことだけできる
+                if v != (old or {}).get(key) and not can_view(conn, target, user):
+                    raise ValueError
                 if not conn.execute("SELECT 1 FROM records WHERE id = ? AND app_id = ?",
-                                    (v, f["config"].get("app_id"))).fetchone():
+                                    (v, target)).fetchone():
                     raise ValueError
             else:
                 v = str(v)
@@ -502,13 +651,184 @@ def display(f: dict, rec: dict) -> str:
     return str(v)
 
 
-# ---------- API: アプリと項目 ----------
+# ---------- API: 認証とユーザー管理 ----------
 
 app = FastAPI(title="カスタムアプリビルダー")
 
 
+@app.middleware("http")
+async def check_origin(request: Request, call_next):
+    """他サイトからの書き込みリクエスト（CSRF）を拒否する。"""
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        hosts = {request.headers.get("host"), request.headers.get("x-forwarded-host")}
+        if origin and urlsplit(origin).netloc not in hosts:
+            return JSONResponse({"detail": "不正なリクエスト元です"}, status_code=403)
+    return await call_next(request)
+
+
+def start_session(conn, request: Request, response: Response, user_id: int):
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat(sep=" ", timespec="seconds")
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))
+    conn.execute("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)",
+                 (sha(token), user_id, expires))
+    secure = os.environ.get("COOKIE_SECURE") == "1" or request.url.scheme == "https"
+    response.set_cookie("session", token, max_age=SESSION_DAYS * 86400, httponly=True,
+                        samesite="lax", secure=secure)
+
+
+def check_account(username: str | None, display_name: str | None, password: str | None):
+    """アカウント情報を検証する（None の項目は検証しない）。"""
+    if username is not None and not re.fullmatch(r"[a-z0-9._-]{3,50}", username):
+        raise HTTPException(400, "ユーザーIDは半角英小文字・数字・._- の3〜50文字で入力してください")
+    if display_name is not None and not 1 <= len(display_name) <= 50:
+        raise HTTPException(400, "表示名は1〜50文字で入力してください")
+    if password is not None and not 8 <= len(password) <= 200:
+        raise HTTPException(400, "パスワードは8文字以上で入力してください")
+
+
+def insert_user(conn, body, role: str) -> int:
+    username, display_name = body.username.strip().lower(), body.display_name.strip()
+    check_account(username, display_name, body.password)
+    if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+        raise HTTPException(400, f"ユーザーID「{username}」は既に使われています")
+    return conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, role, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (username, display_name, hash_password(body.password), role, now())).lastrowid
+
+
+@app.get("/api/auth/state")
+def auth_state(request: Request):
+    with connect() as conn:
+        setup = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+    try:
+        user = public_user(current_user(request))
+    except HTTPException:
+        user = None
+    return {"setup_required": setup, "user": user}
+
+
+@app.post("/api/auth/setup")
+def auth_setup(body: AccountIn, request: Request, response: Response):
+    """ユーザーが1人もいないときだけ使える。最初の1人をシステム管理者として登録する。"""
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+            raise HTTPException(403, "初期設定は完了しています")
+        uid = insert_user(conn, body, "admin")
+        start_session(conn, request, response, uid)
+        return public_user(conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone())
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginIn, request: Request, response: Response):
+    username = body.username.strip().lower()
+    count, until = _login_failures.get(username, (0, datetime.min))
+    if count >= MAX_LOGIN_FAILURES and datetime.now() < until:
+        raise HTTPException(429, "ログインに続けて失敗しました。1分ほど待ってからやり直してください")
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ? AND active = 1",
+                           (username,)).fetchone()
+        # ユーザーの有無で応答時間が変わらないよう、存在しなくてもハッシュ計算を行う
+        ok = check_password(body.password, row["password_hash"] if row else DUMMY_HASH)
+        if not row or not ok:
+            if datetime.now() >= until:
+                count = 0 if count >= MAX_LOGIN_FAILURES else count
+            _login_failures[username] = (count + 1, datetime.now() + timedelta(seconds=60))
+            raise HTTPException(401, "ユーザーIDまたはパスワードが違います")
+        _login_failures.pop(username, None)
+        start_session(conn, request, response, row["id"])
+        return public_user(row)
+
+
+@app.post("/api/auth/logout", status_code=204)
+def auth_logout(request: Request, response: Response):
+    token = request.cookies.get("session")
+    if token:
+        with connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (sha(token),))
+    response.delete_cookie("session")
+
+
+@app.put("/api/auth/profile")
+def update_profile(body: ProfileIn, user: User):
+    name = body.display_name.strip()
+    check_account(None, name, None)
+    with connect() as conn:
+        conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (name, user["id"]))
+    return public_user({**user, "display_name": name})
+
+
+@app.put("/api/auth/password", status_code=204)
+def change_password(body: PasswordIn, request: Request, user: User):
+    if not check_password(body.current, user["password_hash"]):
+        raise HTTPException(400, "現在のパスワードが違います")
+    check_account(None, None, body.new)
+    with connect() as conn:
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                     (hash_password(body.new), user["id"]))
+        # 他の端末のログインは無効にする
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                     (user["id"], sha(request.cookies.get("session", ""))))
+
+
+@app.get("/api/users/directory")
+def user_directory(user: User):
+    """権限設定の選択肢用。有効なユーザーの名前だけを返す。"""
+    with connect() as conn:
+        rows = conn.execute("SELECT id, username, display_name FROM users WHERE active = 1 "
+                            "ORDER BY display_name, id")
+        return [dict(r) for r in rows]
+
+
+@app.get("/api/users")
+def list_users(admin: Admin):
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY id")
+        return [{**public_user(r), "active": bool(r["active"]), "created_at": r["created_at"]}
+                for r in rows]
+
+
+@app.post("/api/users", status_code=201)
+def create_user(body: UserCreateIn, admin: Admin):
+    if body.role not in ("admin", "user"):
+        raise HTTPException(400, "種別が正しくありません")
+    with connect() as conn:
+        uid = insert_user(conn, body, body.role)
+        return public_user(conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone())
+
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: int, body: UserUpdateIn, admin: Admin):
+    name = body.display_name.strip()
+    check_account(None, name, body.password or None)
+    if body.role not in ("admin", "user"):
+        raise HTTPException(400, "種別が正しくありません")
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            raise HTTPException(404, "ユーザーが見つかりません")
+        if body.role != "admin" or not body.active:
+            others = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin' "
+                                  "AND active = 1 AND id != ?", (user_id,)).fetchone()[0]
+            if not others:
+                raise HTTPException(400, "有効なシステム管理者が1人もいなくなる変更はできません")
+        conn.execute("UPDATE users SET display_name = ?, role = ?, active = ? WHERE id = ?",
+                     (name, body.role, int(body.active), user_id))
+        if body.password:
+            conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                         (hash_password(body.password), user_id))
+        if body.password or not body.active:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return {**public_user(row), "active": bool(row["active"])}
+
+
+# ---------- API: アプリと項目 ----------
+
 @app.get("/api/meta")
-def meta():
+def meta(user: User):
     return {
         "field_types": FIELD_TYPES,
         "lookup_display_types": LOOKUP_DISPLAY_TYPES,
@@ -520,17 +840,18 @@ def meta():
 
 
 @app.get("/api/apps")
-def list_apps():
+def list_apps(user: User):
     with connect() as conn:
         rows = conn.execute(
             "SELECT a.*, (SELECT COUNT(*) FROM records r WHERE r.app_id = a.id) "
-            "AS record_count FROM apps a ORDER BY a.id")
-        return [dict(r) for r in rows]
+            "AS record_count FROM apps a ORDER BY a.id").fetchall()
+        apps = [{**dict(r), "role": app_role(conn, dict(r), user)} for r in rows]
+        return [a for a in apps if a["role"] != "none"]
 
 
 @app.post("/api/apps", status_code=201)
-def create_app(body: AppIn, request: Request):
-    user, fields = current_user(request), []
+def create_app(body: AppIn, user: User):
+    fields = []
     if body.template:
         if body.template not in TEMPLATES:
             raise HTTPException(400, "不明なテンプレートです")
@@ -545,55 +866,91 @@ def create_app(body: AppIn, request: Request):
                 "VALUES (?,?,?,?,?,?)",
                 (cur.lastrowid, f["label"], f["type"], int(f.get("required", False)),
                  json.dumps(f.get("options", []), ensure_ascii=False), i))
-        # 作成者は最初からそのアプリの通知を受け取る
-        conn.execute("INSERT INTO followers (app_id, user_name) VALUES (?,?)",
-                     (cur.lastrowid, user))
+        # 作成者はそのアプリの管理者になり、最初から通知を受け取る
+        conn.execute("INSERT INTO app_members (app_id, user_id, role) VALUES (?,?,'manager')",
+                     (cur.lastrowid, user["id"]))
+        conn.execute("INSERT INTO app_followers (app_id, user_id) VALUES (?,?)",
+                     (cur.lastrowid, user["id"]))
         return app_detail(conn, cur.lastrowid, user)
 
 
 @app.get("/api/apps/{app_id}")
-def read_app(app_id: int, request: Request):
+def read_app(app_id: int, user: User):
     with connect() as conn:
-        return app_detail(conn, app_id, current_user(request))
+        return app_detail(conn, app_id, user)
 
 
 @app.put("/api/apps/{app_id}")
-def update_app(app_id: int, body: AppIn, request: Request):
+def update_app(app_id: int, body: AppIn, user: User):
     with connect() as conn:
-        get_app(conn, app_id)
+        get_app(conn, app_id, user, "manager")
         conn.execute("UPDATE apps SET name = ?, description = ?, icon = ? WHERE id = ?",
                      (body.name.strip(), body.description.strip(), body.icon or "📋", app_id))
-        return app_detail(conn, app_id, current_user(request))
+        return app_detail(conn, app_id, user)
 
 
 @app.delete("/api/apps/{app_id}", status_code=204)
-def delete_app(app_id: int):
+def delete_app(app_id: int, user: User):
     with connect() as conn:
-        get_app(conn, app_id)
+        get_app(conn, app_id, user, "manager")
         remove_files(conn, "app_id = ?", [app_id])
         conn.execute("DELETE FROM apps WHERE id = ?", (app_id,))
 
 
 @app.put("/api/apps/{app_id}/follow")
-def set_follow(app_id: int, body: FollowIn, request: Request):
-    user = current_user(request)
+def set_follow(app_id: int, body: FollowIn, user: User):
     with connect() as conn:
-        get_app(conn, app_id)
+        get_app(conn, app_id, user)
         if body.follow:
-            conn.execute("INSERT OR IGNORE INTO followers (app_id, user_name) VALUES (?,?)",
-                         (app_id, user))
+            conn.execute("INSERT OR IGNORE INTO app_followers (app_id, user_id) VALUES (?,?)",
+                         (app_id, user["id"]))
         else:
-            conn.execute("DELETE FROM followers WHERE app_id = ? AND user_name = ?",
-                         (app_id, user))
+            conn.execute("DELETE FROM app_followers WHERE app_id = ? AND user_id = ?",
+                         (app_id, user["id"]))
         return {"following": body.follow}
 
 
+@app.get("/api/apps/{app_id}/access")
+def read_access(app_id: int, user: User):
+    with connect() as conn:
+        a = get_app(conn, app_id, user, "manager")
+        rows = conn.execute(
+            "SELECT m.user_id, m.role, u.username, u.display_name FROM app_members m "
+            "JOIN users u ON u.id = m.user_id WHERE m.app_id = ? ORDER BY u.display_name, u.id",
+            (app_id,))
+        return {"default_role": a["default_role"], "members": [dict(r) for r in rows]}
+
+
+@app.put("/api/apps/{app_id}/access")
+def update_access(app_id: int, body: AccessIn, user: User):
+    """アクセス権を丸ごと置き換える。default_role は個別指定のない全ユーザーに適用される。"""
+    if body.default_role not in ("none", "viewer", "editor"):
+        raise HTTPException(400, "全ユーザーの権限が正しくありません")
+    members = {m.user_id: m.role for m in body.members}
+    if any(r not in ("viewer", "editor", "manager") for r in members.values()):
+        raise HTTPException(400, "権限の種類が正しくありません")
+    with connect() as conn:
+        get_app(conn, app_id, user, "manager")
+        if user["role"] != "admin" and members.get(user["id"]) != "manager":
+            raise HTTPException(400, "自分自身の管理権限は外せません")
+        ids = list(members)
+        known = conn.execute(f"SELECT COUNT(*) FROM users WHERE id IN ({marks(ids)})",
+                             ids).fetchone()[0] if ids else 0
+        if known != len(ids):
+            raise HTTPException(400, "存在しないユーザーが含まれています")
+        conn.execute("UPDATE apps SET default_role = ? WHERE id = ?", (body.default_role, app_id))
+        conn.execute("DELETE FROM app_members WHERE app_id = ?", (app_id,))
+        conn.executemany("INSERT INTO app_members (app_id, user_id, role) VALUES (?,?,?)",
+                         [(app_id, uid, role) for uid, role in members.items()])
+    return read_access(app_id, user)
+
+
 @app.put("/api/apps/{app_id}/fields")
-def replace_fields(app_id: int, body: FieldsIn):
+def replace_fields(app_id: int, body: FieldsIn, user: User):
     """項目定義を丸ごと置き換える。id の無い項目は新規、リストに無い既存項目は削除。"""
     items = clean_fields(body.fields)
     with connect() as conn:
-        get_app(conn, app_id)
+        get_app(conn, app_id, user, "manager")
         existing = {f["id"]: f for f in get_fields(conn, app_id)}
         keep = set()
         for pos, f in enumerate(items):
@@ -604,7 +961,7 @@ def replace_fields(app_id: int, body: FieldsIn):
                     raise HTTPException(400, f"「{f.label}」: 既存項目のタイプは変更できません")
                 keep.add(f.id)
             if f.type == "lookup":
-                check_lookup(conn, f, existing.get(f.id))
+                check_lookup(conn, f, existing.get(f.id), user)
             opts = json.dumps(f.options, ensure_ascii=False)
             config = json.dumps(f.config)
             if f.id is None:
@@ -626,14 +983,17 @@ def replace_fields(app_id: int, body: FieldsIn):
 
 
 @app.get("/api/apps/{app_id}/fields/{field_id}/candidates")
-def lookup_candidates(app_id: int, field_id: int, q: str = ""):
+def lookup_candidates(app_id: int, field_id: int, user: User, q: str = ""):
     """参照項目の入力時に、参照先アプリのレコードを検索して候補を返す。"""
     with connect() as conn:
+        get_app(conn, app_id, user)
         f = next((f for f in get_fields(conn, app_id)
                   if f["id"] == field_id and f["type"] == "lookup"), None)
         if not f:
             raise HTTPException(404, "参照項目が見つかりません")
         cfg = f["config"]
+        if not can_view(conn, cfg["app_id"], user):
+            raise HTTPException(403, "参照先アプリを閲覧する権限がありません")
         esc = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = conn.execute(
             "SELECT id FROM records WHERE app_id = ? "
@@ -647,11 +1007,11 @@ def lookup_candidates(app_id: int, field_id: int, q: str = ""):
 # ---------- API: レコード ----------
 
 @app.get("/api/apps/{app_id}/records")
-def list_records(app_id: int, request: Request, sort: str = "id", order: str = "desc",
-                 page: int = 1, per_page: int = 20):
+def list_records(app_id: int, request: Request, user: User, sort: str = "id",
+                 order: str = "desc", page: int = 1, per_page: int = 20):
     page, per_page = max(page, 1), min(max(per_page, 1), 200)
     with connect() as conn:
-        get_app(conn, app_id)
+        get_app(conn, app_id, user)
         fields = get_fields(conn, app_id)
         where, args = build_where(app_id, fields, request.query_params)
         sort_sql = "id"
@@ -670,64 +1030,70 @@ def list_records(app_id: int, request: Request, sort: str = "id", order: str = "
             f"ORDER BY {sort_sql} {direction}, id DESC LIMIT ? OFFSET ?",
             [*args, per_page, (page - 1) * per_page]).fetchall()
         return {"total": total, "page": page, "per_page": per_page,
-                "records": present(conn, fields, rows)}
+                "records": present(conn, fields, rows, user)}
 
 
 @app.get("/api/apps/{app_id}/records/{record_id}")
-def read_record(app_id: int, record_id: int):
+def read_record(app_id: int, record_id: int, user: User):
     with connect() as conn:
+        get_app(conn, app_id, user)
         row = get_record(conn, app_id, record_id)
-        return present(conn, get_fields(conn, app_id), [row])[0]
+        return present(conn, get_fields(conn, app_id), [row], user)[0]
 
 
 @app.post("/api/apps/{app_id}/records", status_code=201)
-def create_record(app_id: int, body: RecordIn, request: Request):
-    user = current_user(request)
+def create_record(app_id: int, body: RecordIn, user: User):
+    name = user["display_name"]
     with connect() as conn:
-        get_app(conn, app_id)
+        a = get_app(conn, app_id, user, "editor")
         fields = get_fields(conn, app_id)
-        data = validate_record(conn, app_id, fields, body.data)
+        data = validate_record(conn, app_id, fields, body.data, user)
         ts = now()
         rid = conn.execute(
-            "INSERT INTO records (app_id, data, created_at, updated_at, created_by, updated_by) "
-            "VALUES (?,?,?,?,?,?)",
-            (app_id, json.dumps(data, ensure_ascii=False), ts, ts, user, user)).lastrowid
+            "INSERT INTO records (app_id, data, created_at, updated_at, created_by, updated_by, "
+            "created_by_id) VALUES (?,?,?,?,?,?,?)",
+            (app_id, json.dumps(data, ensure_ascii=False), ts, ts, name, name,
+             user["id"])).lastrowid
         sync_attachments(conn, rid, fields, data)
-        notify(conn, app_id, rid, user, f"{user} さんがレコード No.{rid} を登録しました")
-        return present(conn, fields, [get_record(conn, app_id, rid)])[0]
+        notify(conn, a, rid, user, f"{name} さんがレコード No.{rid} を登録しました")
+        return present(conn, fields, [get_record(conn, app_id, rid)], user)[0]
 
 
 @app.put("/api/apps/{app_id}/records/{record_id}")
-def update_record(app_id: int, record_id: int, body: RecordIn, request: Request):
-    user = current_user(request)
+def update_record(app_id: int, record_id: int, body: RecordIn, user: User):
+    name = user["display_name"]
     with connect() as conn:
+        a = get_app(conn, app_id, user, "editor")
         old = get_record(conn, app_id, record_id)
         fields = get_fields(conn, app_id)
-        data = validate_record(conn, app_id, fields, body.data, record_id)
+        data = validate_record(conn, app_id, fields, body.data, user, record_id,
+                               json.loads(old["data"]))
         conn.execute("UPDATE records SET data = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-                     (json.dumps(data, ensure_ascii=False), now(), user, record_id))
+                     (json.dumps(data, ensure_ascii=False), now(), name, record_id))
         sync_attachments(conn, record_id, fields, data)
-        notify(conn, app_id, record_id, user,
-               f"{user} さんがレコード No.{record_id} を更新しました", [old["created_by"]])
-        return present(conn, fields, [get_record(conn, app_id, record_id)])[0]
+        notify(conn, a, record_id, user,
+               f"{name} さんがレコード No.{record_id} を更新しました", [old["created_by_id"]])
+        return present(conn, fields, [get_record(conn, app_id, record_id)], user)[0]
 
 
 @app.delete("/api/apps/{app_id}/records/{record_id}", status_code=204)
-def delete_record(app_id: int, record_id: int, request: Request):
-    user = current_user(request)
+def delete_record(app_id: int, record_id: int, user: User):
     with connect() as conn:
+        a = get_app(conn, app_id, user, "editor")
         old = get_record(conn, app_id, record_id)
         remove_files(conn, "record_id = ?", [record_id])
         conn.execute("DELETE FROM records WHERE id = ?", (record_id,))
-        notify(conn, app_id, None, user,
-               f"{user} さんがレコード No.{record_id} を削除しました", [old["created_by"]])
+        notify(conn, a, None, user,
+               f"{user['display_name']} さんがレコード No.{record_id} を削除しました",
+               [old["created_by_id"]])
 
 
 # ---------- API: コメント ----------
 
 @app.get("/api/apps/{app_id}/records/{record_id}/comments")
-def list_comments(app_id: int, record_id: int):
+def list_comments(app_id: int, record_id: int, user: User):
     with connect() as conn:
+        get_app(conn, app_id, user)
         get_record(conn, app_id, record_id)
         rows = conn.execute("SELECT * FROM comments WHERE record_id = ? ORDER BY id",
                             (record_id,))
@@ -735,34 +1101,36 @@ def list_comments(app_id: int, record_id: int):
 
 
 @app.post("/api/apps/{app_id}/records/{record_id}/comments", status_code=201)
-def add_comment(app_id: int, record_id: int, body: CommentIn, request: Request):
-    user, text = current_user(request), body.body.strip()
+def add_comment(app_id: int, record_id: int, body: CommentIn, user: User):
+    name, text = user["display_name"], body.body.strip()
     if not text:
         raise HTTPException(400, "コメントを入力してください")
     with connect() as conn:
+        a = get_app(conn, app_id, user, "editor")
         rec = get_record(conn, app_id, record_id)
         # レコードの作成者と、これまでにコメントした人にも知らせる
-        others = [r["author"] for r in conn.execute(
-            "SELECT DISTINCT author FROM comments WHERE record_id = ?", (record_id,))]
+        others = [r["author_id"] for r in conn.execute(
+            "SELECT DISTINCT author_id FROM comments WHERE record_id = ?", (record_id,))]
         cid = conn.execute(
-            "INSERT INTO comments (record_id, author, body, created_at) VALUES (?,?,?,?)",
-            (record_id, user, text, now())).lastrowid
+            "INSERT INTO comments (record_id, author, author_id, body, created_at) "
+            "VALUES (?,?,?,?,?)", (record_id, name, user["id"], text, now())).lastrowid
         excerpt = text[:60] + ("…" if len(text) > 60 else "")
-        notify(conn, app_id, record_id, user,
-               f"{user} さんがレコード No.{record_id} にコメントしました: {excerpt}",
-               [rec["created_by"], *others])
+        notify(conn, a, record_id, user,
+               f"{name} さんがレコード No.{record_id} にコメントしました: {excerpt}",
+               [rec["created_by_id"], *others])
         return dict(conn.execute("SELECT * FROM comments WHERE id = ?", (cid,)).fetchone())
 
 
 @app.delete("/api/apps/{app_id}/records/{record_id}/comments/{comment_id}", status_code=204)
-def delete_comment(app_id: int, record_id: int, comment_id: int, request: Request):
+def delete_comment(app_id: int, record_id: int, comment_id: int, user: User):
     with connect() as conn:
+        a = get_app(conn, app_id, user)
         get_record(conn, app_id, record_id)
-        row = conn.execute("SELECT author FROM comments WHERE id = ? AND record_id = ?",
+        row = conn.execute("SELECT author_id FROM comments WHERE id = ? AND record_id = ?",
                            (comment_id, record_id)).fetchone()
         if not row:
             raise HTTPException(404, "コメントが見つかりません")
-        if row["author"] != current_user(request):
+        if row["author_id"] != user["id"] and a["role"] != "manager":
             raise HTTPException(403, "自分のコメントだけ削除できます")
         conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
 
@@ -770,9 +1138,10 @@ def delete_comment(app_id: int, record_id: int, comment_id: int, request: Reques
 # ---------- API: 添付ファイル ----------
 
 @app.post("/api/apps/{app_id}/fields/{field_id}/files", status_code=201)
-async def upload_file(app_id: int, field_id: int, file: UploadFile = File(...)):
+async def upload_file(app_id: int, field_id: int, user: User, file: UploadFile = File(...)):
     """ファイルを仮アップロードする。レコード保存時にそのレコードへ紐付けられる。"""
     with connect() as conn:
+        get_app(conn, app_id, user, "editor")
         if not conn.execute("SELECT 1 FROM fields WHERE id = ? AND app_id = ? AND type = 'file'",
                             (field_id, app_id)).fetchone():
             raise HTTPException(404, "添付ファイル項目が見つかりません")
@@ -801,11 +1170,13 @@ async def upload_file(app_id: int, field_id: int, file: UploadFile = File(...)):
 
 
 @app.get("/api/files/{file_id}")
-def download_file(file_id: int):
+def download_file(file_id: int, user: User):
     with connect() as conn:
         row = conn.execute("SELECT * FROM attachments WHERE id = ?", (file_id,)).fetchone()
-    if not row or not (upload_dir() / row["stored"]).is_file():
-        raise HTTPException(404, "ファイルが見つかりません")
+        # 権限がない場合も、存在を知らせないよう 404 にする
+        if not row or not can_view(conn, row["app_id"], user) \
+                or not (upload_dir() / row["stored"]).is_file():
+            raise HTTPException(404, "ファイルが見つかりません")
     # ブラウザ内で開かせず必ずダウンロードさせる（HTML 等をアップロードされても実行されない）
     return FileResponse(upload_dir() / row["stored"], filename=row["name"],
                         media_type="application/octet-stream",
@@ -815,33 +1186,31 @@ def download_file(file_id: int):
 # ---------- API: 通知 ----------
 
 @app.get("/api/notifications")
-def list_notifications(request: Request):
-    user = current_user(request)
+def list_notifications(user: User):
     with connect() as conn:
         unread = conn.execute(
-            "SELECT COUNT(*) FROM notifications WHERE recipient = ? AND read = 0",
-            (user,)).fetchone()[0]
+            "SELECT COUNT(*) FROM user_notifications WHERE user_id = ? AND read = 0",
+            (user["id"],)).fetchone()[0]
         rows = conn.execute(
-            "SELECT n.*, a.name AS app_name, a.icon AS app_icon FROM notifications n "
-            "JOIN apps a ON a.id = n.app_id WHERE n.recipient = ? ORDER BY n.id DESC LIMIT 50",
-            (user,))
+            "SELECT n.*, a.name AS app_name, a.icon AS app_icon FROM user_notifications n "
+            "JOIN apps a ON a.id = n.app_id WHERE n.user_id = ? ORDER BY n.id DESC LIMIT 50",
+            (user["id"],))
         return {"unread": unread, "items": [{**dict(r), "read": bool(r["read"])} for r in rows]}
 
 
 @app.post("/api/notifications/read", status_code=204)
-def read_notifications(request: Request):
+def read_notifications(user: User):
     with connect() as conn:
-        conn.execute("UPDATE notifications SET read = 1 WHERE recipient = ?",
-                     (current_user(request),))
+        conn.execute("UPDATE user_notifications SET read = 1 WHERE user_id = ?", (user["id"],))
 
 
 # ---------- API: 集計と CSV ----------
 
 @app.get("/api/apps/{app_id}/aggregate")
-def aggregate(app_id: int, group: int, sum: int | None = None):
+def aggregate(app_id: int, group: int, user: User, sum: int | None = None):
     """group 項目の値ごとに件数（と sum 項目の合計）を集計する。"""
     with connect() as conn:
-        get_app(conn, app_id)
+        get_app(conn, app_id, user)
         fields = {f["id"]: f for f in get_fields(conn, app_id)}
         if group not in fields or fields[group]["type"] == "file":
             raise HTTPException(400, "集計項目が正しくありません")
@@ -849,14 +1218,15 @@ def aggregate(app_id: int, group: int, sum: int | None = None):
             raise HTTPException(400, "合計できるのは数値項目のみです")
         gf, result = fields[group], {}
         rows = conn.execute("SELECT * FROM records WHERE app_id = ?", (app_id,)).fetchall()
-        for rec in present(conn, [gf], rows):
+        for rec in present(conn, [gf], rows, user):
             v = rec["data"].get(str(group))
             if gf["type"] == "check":
                 keys = ["オン" if v else "オフ"]
             elif gf["type"] == "multi":
                 keys = v or ["（未入力）"]
             elif gf["type"] == "lookup" and v is not None:
-                keys = [rec["refs"][str(group)]["label"] or "（削除済み）"]
+                ref = rec["refs"][str(group)]
+                keys = [ref["label"] or ("（権限なし）" if ref["restricted"] else "（削除済み）")]
             else:
                 keys = ["（未入力）" if v in (None, "") else str(v)]
             amount = rec["data"].get(str(sum), 0) if sum is not None else 0
@@ -871,13 +1241,13 @@ def aggregate(app_id: int, group: int, sum: int | None = None):
 
 
 @app.get("/api/apps/{app_id}/export.csv")
-def export_csv(app_id: int, request: Request):
+def export_csv(app_id: int, request: Request, user: User):
     with connect() as conn:
-        a = get_app(conn, app_id)
+        a = get_app(conn, app_id, user)
         fields = get_fields(conn, app_id)
         where, args = build_where(app_id, fields, request.query_params)
         rows = conn.execute(f"SELECT * FROM records WHERE {where} ORDER BY id", args).fetchall()
-        recs = present(conn, fields, rows)
+        recs = present(conn, fields, rows, user)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["ID", *[f["label"] for f in fields], "作成日時", "更新日時"])
@@ -891,9 +1261,9 @@ def export_csv(app_id: int, request: Request):
 
 
 @app.post("/api/apps/{app_id}/import")
-async def import_csv(app_id: int, request: Request, file: UploadFile = File(...)):
+async def import_csv(app_id: int, user: User, file: UploadFile = File(...)):
     """CSV を取り込む。1行目を項目名として照合し、エラー行はスキップして報告する。"""
-    user = current_user(request)
+    name = user["display_name"]
     raw = await file.read()
     try:
         text = raw.decode("utf-8-sig")
@@ -907,7 +1277,7 @@ async def import_csv(app_id: int, request: Request, file: UploadFile = File(...)
         raise HTTPException(400, "CSV が空です")
     header = [h.strip() for h in rows[0]]
     with connect() as conn:
-        get_app(conn, app_id)
+        a = get_app(conn, app_id, user, "editor")
         fields = get_fields(conn, app_id)
         # 添付ファイルは CSV では取り込めないので列を無視する
         cols = {f["label"]: f for f in fields if f["type"] != "file"}
@@ -937,7 +1307,7 @@ async def import_csv(app_id: int, request: Request, file: UploadFile = File(...)
                     cell = hit["id"] if hit else -1
                 data[str(f["id"])] = cell
             try:
-                cleaned = validate_record(conn, app_id, fields, data)
+                cleaned = validate_record(conn, app_id, fields, data, user)
             except HTTPException as e:
                 labels = {str(f["id"]): f["label"] for f in fields}
                 msg = "、".join(f"{labels[k]}: {m}" for k, m in e.detail["errors"].items())
@@ -946,11 +1316,11 @@ async def import_csv(app_id: int, request: Request, file: UploadFile = File(...)
             ts = now()
             conn.execute(
                 "INSERT INTO records (app_id, data, created_at, updated_at, created_by, "
-                "updated_by) VALUES (?,?,?,?,?,?)",
-                (app_id, json.dumps(cleaned, ensure_ascii=False), ts, ts, user, user))
+                "updated_by, created_by_id) VALUES (?,?,?,?,?,?,?)",
+                (app_id, json.dumps(cleaned, ensure_ascii=False), ts, ts, name, name, user["id"]))
             imported += 1
         if imported:
-            notify(conn, app_id, None, user, f"{user} さんが CSV から {imported} 件を取り込みました")
+            notify(conn, a, None, user, f"{name} さんが CSV から {imported} 件を取り込みました")
         return {"imported": imported, "errors": errors}
 
 

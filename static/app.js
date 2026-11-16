@@ -21,13 +21,12 @@ function fill(el, ...kids) {
   el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
 }
 
-// 表示名（コメントの投稿者・通知の宛先に使う。認証ではない）はブラウザに保存する。
-let USER = '';
-try { USER = localStorage.getItem('userName') || ''; } catch { /* 保存できない環境でも動かす */ }
-const userName = () => USER || 'ゲスト';
+let ME = null; // ログイン中のユーザー（未ログインなら null）
+const userName = () => (ME ? ME.display_name : '');
+const ROLE_LABELS = { viewer: '閲覧のみ', editor: '編集可', manager: '管理' };
 
 async function api(method, url, body) {
-  const opt = { method, headers: { 'X-User-Name': encodeURIComponent(USER) } };
+  const opt = { method, headers: {} };
   if (body instanceof FormData) opt.body = body;
   else if (body !== undefined) {
     opt.headers['Content-Type'] = 'application/json';
@@ -37,6 +36,8 @@ async function api(method, url, body) {
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // セッション切れ・無効化などでログインが外れたらログイン画面へ戻す
+    if (res.status === 401 && !url.startsWith('/api/auth/') && ME) { ME = null; showAuth(false); }
     const d = data.detail;
     const err = new Error(typeof d === 'string' ? d : '入力内容を確認してください');
     if (d && d.errors) err.fieldErrors = d.errors;
@@ -61,6 +62,7 @@ function openDialog({ title, body, submitLabel = '保存', onSubmit, extra = [] 
       method: 'dialog',
       onsubmit: async e => {
         e.preventDefault();
+        if (!onSubmit) return;
         try { await onSubmit(); dlg.close(); }
         catch (err) { if (!err.fieldErrors) toast(err.message); }
       },
@@ -86,14 +88,17 @@ const listState = {};
 // ---------- ルーティング ----------
 
 async function route() {
+  if (!ME) return;
   if (!META) META = await api('GET', '/api/meta');
   // 画面を切り替えるときは開いているダイアログを閉じる
   document.querySelectorAll('dialog').forEach(d => d.close());
   const m = location.hash.match(/^#\/app\/(\d+)(?:\/(\w+))?(?:\/(\d+))?/);
   try {
+    if (location.hash === '#/users' && ME.role === 'admin') return await viewUsers();
     if (!m) return await viewHome();
     const app = await api('GET', `/api/apps/${m[1]}`);
-    const tab = m[2] === 'record' ? 'records' : m[2] || 'records';
+    let tab = m[2] === 'record' ? 'records' : m[2] || 'records';
+    if (tab === 'settings' && app.role !== 'manager') tab = 'records';
     const content = h('div');
     fill(main, appHeader(app, tab), content);
     if (tab === 'settings') await viewSettings(app, content);
@@ -111,37 +116,150 @@ async function route() {
       }
     }
   } catch (err) {
+    if (!ME) return; // ログインが外れた場合はログイン画面を表示済み
     fill(main, h('div', { class: 'empty' }, err.message, h('p', {}, h('a', { href: '#/' }, 'アプリ一覧へ戻る'))));
   }
 }
 window.addEventListener('hashchange', route);
-route().then(() => { if (!USER) userDialog(); });
+boot();
 
-// ---------- 表示名と通知 ----------
+// ---------- ログインとアカウント ----------
 
 const userBtn = document.getElementById('userBtn');
 const badge = document.getElementById('badge');
 function showUser() { userBtn.textContent = '👤 ' + userName(); }
-showUser();
-userBtn.addEventListener('click', userDialog);
+userBtn.addEventListener('click', accountDialog);
 
-function userDialog() {
-  const input = h('input', { class: 'wide', value: USER, maxLength: 50, required: true, placeholder: '例: 山田' });
-  openDialog({
-    title: '表示名の設定',
+async function boot() {
+  const st = await api('GET', '/api/auth/state');
+  if (st.user) signedIn(st.user); else showAuth(st.setup_required);
+}
+
+function signedIn(user) {
+  ME = user;
+  document.body.classList.add('signed-in');
+  showUser(); pollNotifications(); route();
+}
+
+// ログイン画面。ユーザーが1人もいないときは最初の管理者を登録する画面になる。
+function showAuth(setup) {
+  document.body.classList.remove('signed-in');
+  document.querySelectorAll('dialog').forEach(d => d.close());
+  const username = h('input', { class: 'wide', required: true, autocomplete: 'username', autocapitalize: 'none', maxLength: 50 });
+  const display = h('input', { class: 'wide', required: true, maxLength: 50, placeholder: '例: 山田 太郎' });
+  const password = h('input', { class: 'wide', type: 'password', required: true, autocomplete: setup ? 'new-password' : 'current-password' });
+  const error = h('div', { class: 'error', role: 'alert' });
+  fill(main, h('form', {
+    class: 'panel auth',
+    onsubmit: async e => {
+      e.preventDefault();
+      error.textContent = '';
+      try {
+        signedIn(setup
+          ? await api('POST', '/api/auth/setup', { username: username.value, display_name: display.value, password: password.value })
+          : await api('POST', '/api/auth/login', { username: username.value, password: password.value }));
+      } catch (err) { error.textContent = err.message; }
+    },
+  },
+    h('h1', {}, setup ? '初期設定' : 'ログイン'),
+    setup && h('p', { class: 'muted' }, '最初のユーザーを登録します。このユーザーがシステム管理者になり、ほかのユーザーを追加できます。'),
+    h('div', { class: 'form-field' }, h('label', {}, 'ユーザーID'), username,
+      setup && h('div', { class: 'muted' }, '半角英小文字・数字・._- の3〜50文字')),
+    setup && h('div', { class: 'form-field' }, h('label', {}, '表示名'), display),
+    h('div', { class: 'form-field' }, h('label', {}, 'パスワード'), password,
+      setup && h('div', { class: 'muted' }, '8文字以上')),
+    error,
+    h('button', { class: 'primary wide', type: 'submit' }, setup ? '登録して始める' : 'ログイン')));
+  username.focus();
+}
+
+function accountDialog() {
+  const display = h('input', { class: 'wide', value: ME.display_name, maxLength: 50 });
+  const current = h('input', { class: 'wide', type: 'password', autocomplete: 'current-password' });
+  const next = h('input', { class: 'wide', type: 'password', autocomplete: 'new-password' });
+  const dlg = openDialog({
+    title: `アカウント（${ME.username}）`,
     body: [
-      h('div', { class: 'form-field' }, h('label', {}, '表示名'), input),
-      h('div', { class: 'muted' }, 'コメントの投稿者名と通知の宛先に使います。このブラウザに保存されます。'),
+      h('div', { class: 'form-field' }, h('label', {}, '表示名'), display),
+      h('h2', { style: 'margin-top:18px' }, 'パスワードの変更'),
+      h('div', { class: 'muted', style: 'margin-bottom:8px' }, '変更しない場合は空のままにしてください。'),
+      h('div', { class: 'form-field' }, h('label', {}, '現在のパスワード'), current),
+      h('div', { class: 'form-field' }, h('label', {}, '新しいパスワード（8文字以上）'), next),
+    ],
+    extra: [
+      h('button', {
+        type: 'button',
+        onclick: async () => {
+          await api('POST', '/api/auth/logout');
+          ME = null; META = null; showAuth(false);
+        },
+      }, 'ログアウト'),
+      ME.role === 'admin' && h('a', { class: 'btn', href: '#/users', onclick: () => dlg.close() }, 'ユーザー管理'),
     ],
     onSubmit: async () => {
-      USER = input.value.trim();
-      try { localStorage.setItem('userName', USER); } catch { /* 保存できなくても続行 */ }
-      showUser(); pollNotifications(); route();
+      if (next.value || current.value) {
+        await api('PUT', '/api/auth/password', { current: current.value, new: next.value });
+      }
+      if (display.value.trim() !== ME.display_name) {
+        ME = await api('PUT', '/api/auth/profile', { display_name: display.value });
+        showUser();
+      }
+      toast('保存しました');
     },
   });
 }
 
+// ---------- ユーザー管理（システム管理者のみ） ----------
+
+async function viewUsers() {
+  const users = await api('GET', '/api/users');
+  fill(main,
+    h('div', { class: 'row' },
+      h('h1', {}, 'ユーザー管理'), h('span', { class: 'spacer' }),
+      h('button', { class: 'primary', onclick: () => userDialog(null) }, '＋ ユーザーを追加')),
+    h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['ユーザーID', '表示名', '種別', '状態', '登録日時'].map(t => h('th', { style: 'cursor:default' }, t)))),
+      h('tbody', {}, users.map(u => h('tr', { tabIndex: 0, onclick: () => userDialog(u), onkeydown: e => { if (e.key === 'Enter') userDialog(u); } },
+        h('td', {}, u.username), h('td', {}, u.display_name),
+        h('td', {}, u.role === 'admin' ? 'システム管理者' : '一般'),
+        h('td', {}, u.active ? '有効' : h('span', { class: 'muted' }, '無効')),
+        h('td', { class: 'muted' }, u.created_at)))))),
+    h('p', { class: 'muted' }, 'システム管理者は、ユーザーの管理と全アプリの管理ができます。無効にしたユーザーはログインできなくなります（データは残ります）。'));
+}
+
+function userDialog(u) {
+  const username = h('input', { class: 'wide', required: true, maxLength: 50, autocapitalize: 'none', value: u ? u.username : '', disabled: !!u });
+  const display = h('input', { class: 'wide', required: true, maxLength: 50, value: u ? u.display_name : '' });
+  const password = h('input', { class: 'wide', type: 'password', required: !u, autocomplete: 'new-password' });
+  const role = h('select', { value: u ? u.role : 'user' }, h('option', { value: 'user' }, '一般'), h('option', { value: 'admin' }, 'システム管理者'));
+  const active = h('input', { type: 'checkbox', checked: u ? u.active : true });
+  openDialog({
+    title: u ? `ユーザー「${u.username}」を編集` : 'ユーザーを追加',
+    submitLabel: u ? '保存' : '追加',
+    body: [
+      h('div', { class: 'form-field' }, h('label', {}, 'ユーザーID'), username,
+        !u && h('div', { class: 'muted' }, '半角英小文字・数字・._- の3〜50文字。後から変更できません。')),
+      h('div', { class: 'form-field' }, h('label', {}, '表示名'), display),
+      h('div', { class: 'form-field' }, h('label', {}, u ? 'パスワードの再設定（変更しない場合は空）' : '初期パスワード（8文字以上）'), password),
+      h('div', { class: 'form-field' }, h('label', {}, '種別'), role),
+      u && h('div', { class: 'form-field' }, h('label', { style: 'font-weight:400' }, active, ' 有効（ログインを許可する）')),
+    ],
+    onSubmit: async () => {
+      if (u) {
+        await api('PUT', `/api/users/${u.id}`, { display_name: display.value, role: role.value, active: active.checked, password: password.value });
+        if (u.id === ME.id) { ME = { ...ME, display_name: display.value.trim(), role: role.value }; showUser(); }
+      } else {
+        await api('POST', '/api/users', { username: username.value, display_name: display.value, password: password.value, role: role.value });
+      }
+      toast('保存しました'); route();
+    },
+  });
+}
+
+// ---------- 通知 ----------
+
 async function pollNotifications() {
+  if (!ME) return null;
   try {
     const r = await api('GET', '/api/notifications');
     badge.textContent = r.unread > 99 ? '99+' : r.unread;
@@ -180,6 +298,7 @@ function appHeader(app, tab) {
       h('span', { style: 'font-size:1.8rem' }, app.icon),
       h('div', {}, h('h1', {}, app.name), h('div', { class: 'muted' }, app.description)),
       h('span', { class: 'spacer' }),
+      h('span', { class: 'chip', title: 'このアプリでのあなたの権限' }, ROLE_LABELS[app.role]),
       h('button', {
         title: 'このアプリのレコード登録・更新・コメントを通知で受け取ります',
         onclick: async () => {
@@ -187,7 +306,7 @@ function appHeader(app, tab) {
           toast(app.following ? '通知を停止しました' : '通知を受け取ります'); route();
         },
       }, app.following ? '🔔 通知を受け取り中' : '🔕 通知を受け取る')),
-    h('nav', { class: 'tabs' }, link('records', 'レコード一覧'), link('summary', '集計'), link('settings', '設定')));
+    h('nav', { class: 'tabs' }, link('records', 'レコード一覧'), link('summary', '集計'), app.role === 'manager' && link('settings', '設定')));
 }
 
 // ---------- アプリ一覧 ----------
@@ -260,7 +379,7 @@ function cellContent(f, v, refs) {
     const ref = refs[f.id];
     return ref && ref.label != null
       ? h('a', { href: `#/app/${ref.app_id}/record/${ref.id}`, onclick: stop }, ref.label)
-      : h('span', { class: 'muted' }, '（削除済み）');
+      : h('span', { class: 'muted' }, ref && ref.restricted ? '（権限なし）' : '（削除済み）');
   }
   if (f.type === 'multi') return v.map(x => h('span', { class: 'chip' }, x));
   if (f.type === 'select' || f.type === 'radio') return h('span', { class: 'chip' }, v);
@@ -275,6 +394,7 @@ function cellContent(f, v, refs) {
 async function viewRecords(app, root) {
   const st = listState[app.id] ||= { q: '', sort: 'id', order: 'desc', page: 1, filters: {} };
   const reload = () => viewRecords(app, root);
+  const canEdit = app.role !== 'viewer';
 
   if (!app.fields.length) {
     fill(root, h('div', { class: 'panel empty' },
@@ -329,9 +449,9 @@ async function viewRecords(app, root) {
     h('div', { class: 'row', style: 'margin-top:14px' },
       search, filters, h('span', { class: 'spacer' }),
       fileInput,
-      h('button', { onclick: () => fileInput.click() }, 'CSV 取り込み'),
+      canEdit && h('button', { onclick: () => fileInput.click() }, 'CSV 取り込み'),
       h('a', { class: 'btn', href: `/api/apps/${app.id}/export.csv?${buildQuery(app, st)}` }, 'CSV 書き出し'),
-      h('button', { class: 'primary', onclick: () => recordDialog(app, null, reload) }, '＋ レコード追加')),
+      canEdit && h('button', { class: 'primary', onclick: () => recordDialog(app, null, reload) }, '＋ レコード追加')),
     res.records.length
       ? h('div', { class: 'table-wrap' }, h('table', {},
           h('thead', {}, h('tr', {}, th('id', 'No.'), app.fields.map(f => th(f.id, f.label)),
@@ -379,7 +499,7 @@ function fieldInput(f, value, ref) {
     }
     case 'lookup': {
       // 参照先アプリのレコードを検索して1件選ぶ
-      let cur = ref ? { id: ref.id, label: ref.label ?? '（削除済み）' } : null;
+      let cur = ref ? { id: ref.id, label: ref.label ?? (ref.restricted ? '（権限なし）' : '（削除済み）') } : null;
       let timer;
       const box = h('div'), results = h('div', { class: 'lookup-results' });
       const search = h('input', {
@@ -432,6 +552,7 @@ function fieldInput(f, value, ref) {
 }
 
 function recordDialog(app, record, onDone) {
+  const canEdit = app.role !== 'viewer'; // 閲覧のみの人には入力欄を無効にして表示だけする
   const getters = {}, errorEls = {};
   const body = app.fields.map(f => {
     const [el, get] = fieldInput(f, record?.data[f.id], record?.refs[f.id]);
@@ -441,11 +562,11 @@ function recordDialog(app, record, onDone) {
       h('div', { class: 'label' }, f.label, f.required && h('span', { class: 'req' }, '*')), el, errorEls[f.id]);
   });
   const dlg = openDialog({
-    title: record ? `レコード No.${record.id} を編集` : 'レコードを追加',
-    body: [body,
+    title: !record ? 'レコードを追加' : canEdit ? `レコード No.${record.id} を編集` : `レコード No.${record.id}`,
+    body: [h('fieldset', { class: 'plain', disabled: !canEdit }, body),
       record && h('div', { class: 'muted' }, `作成: ${record.created_at} ${record.created_by}　更新: ${record.updated_at} ${record.updated_by}`),
       record && commentsSection(app, record, onDone)],
-    extra: record ? [h('button', {
+    extra: record && canEdit ? [h('button', {
       type: 'button', class: 'danger',
       onclick: async () => {
         if (!confirm('このレコードを削除しますか？')) return;
@@ -453,7 +574,7 @@ function recordDialog(app, record, onDone) {
         dlg.close(); toast('削除しました'); onDone();
       },
     }, '削除')] : [],
-    onSubmit: async () => {
+    onSubmit: canEdit && (async () => {
       const data = {};
       for (const f of app.fields) { data[f.id] = getters[f.id](); errorEls[f.id].textContent = ''; }
       try {
@@ -464,7 +585,7 @@ function recordDialog(app, record, onDone) {
         throw err;
       }
       toast('保存しました'); onDone();
-    },
+    }),
   });
   return dlg;
 }
@@ -477,7 +598,7 @@ function commentsSection(app, record, onChange) {
     const items = await api('GET', url);
     fill(listEl, items.length ? items.map(c => h('div', { class: 'comment' },
       h('div', { class: 'row muted' }, h('b', {}, c.author), c.created_at, h('span', { class: 'spacer' }),
-        c.author === userName() && h('button', {
+        (c.author_id === ME.id || app.role === 'manager') && h('button', {
           type: 'button', class: 'icon danger', title: 'コメントを削除',
           onclick: async () => {
             if (!confirm('このコメントを削除しますか？')) return;
@@ -489,8 +610,9 @@ function commentsSection(app, record, onChange) {
   }
   load().catch(err => toast(err.message));
   return h('div', { class: 'comments' },
-    h('h2', {}, 'コメント'), listEl, input,
-    h('div', { class: 'row' }, h('span', { class: 'muted' }, `${userName()} として投稿`), h('span', { class: 'spacer' }),
+    h('h2', {}, 'コメント'), listEl,
+    app.role !== 'viewer' && input,
+    app.role !== 'viewer' && h('div', { class: 'row' }, h('span', { class: 'muted' }, `${userName()} として投稿`), h('span', { class: 'spacer' }),
       h('button', {
         type: 'button',
         onclick: async () => {
@@ -586,6 +708,33 @@ async function viewSettings(app, root) {
   function move(i, d) { [draft[i], draft[i + d]] = [draft[i + d], draft[i]]; renderFields(); }
   renderFields();
 
+  // アクセス権: 全ユーザー向けの既定と、ユーザーごとの個別指定
+  const [access, directory] = await Promise.all([api('GET', `/api/apps/${app.id}/access`), api('GET', '/api/users/directory')]);
+  const members = access.members.map(m => ({ ...m }));
+  const defaultRole = h('select', { value: access.default_role },
+    h('option', { value: 'none' }, 'アクセス不可'), h('option', { value: 'viewer' }, '閲覧のみ'), h('option', { value: 'editor' }, '編集可'));
+  const memberList = h('div');
+  const addSelect = h('select', {
+    'aria-label': 'ユーザーを追加',
+    onchange: () => {
+      const u = directory.find(x => x.id === Number(addSelect.value));
+      if (u) members.push({ user_id: u.id, username: u.username, display_name: u.display_name, role: 'editor' });
+      renderMembers();
+    },
+  });
+  function renderMembers() {
+    fill(memberList, members.length ? members.map((m, i) => h('div', { class: 'row member' },
+      h('span', { class: 'member-name' }, `${m.display_name}（${m.username}）`),
+      h('select', { value: m.role, 'aria-label': `${m.display_name} の権限`, onchange: e => { m.role = e.target.value; } },
+        Object.entries(ROLE_LABELS).map(([k, l]) => h('option', { value: k }, l))),
+      h('button', { class: 'icon danger', title: '個別指定を外す', onclick: () => { members.splice(i, 1); renderMembers(); } }, '✕')))
+      : h('div', { class: 'muted', style: 'padding:8px 0' }, '個別に権限を指定したユーザーはいません。'));
+    fill(addSelect, h('option', { value: '' }, '＋ ユーザーを追加…'),
+      directory.filter(u => !members.some(m => m.user_id === u.id)).map(u => h('option', { value: String(u.id) }, `${u.display_name}（${u.username}）`)));
+    addSelect.value = '';
+  }
+  renderMembers();
+
   fill(root, 
     h('div', { class: 'panel' },
       h('h2', {}, '項目の設定'),
@@ -607,6 +756,24 @@ async function viewSettings(app, root) {
             } catch (err) { toast(err.message); }
           },
         }, '項目を保存'))),
+    h('div', { class: 'panel' },
+      h('h2', {}, 'アクセス権'),
+      h('div', { class: 'muted' }, '閲覧のみ: レコードを見られる　／　編集可: レコードの登録・編集・削除とコメント　／　管理: 項目・アクセス権の設定とアプリの削除。システム管理者は常に管理できます。'),
+      h('div', { class: 'form-field', style: 'margin-top:12px' }, h('label', {}, '全ユーザー（個別指定のない人）'), defaultRole),
+      h('div', { class: 'label', style: 'font-weight:600;font-size:.9rem' }, 'ユーザーごとの指定'),
+      memberList,
+      h('div', { class: 'row', style: 'margin-top:8px' }, addSelect, h('span', { class: 'spacer' }),
+        h('button', {
+          class: 'primary',
+          onclick: async () => {
+            try {
+              await api('PUT', `/api/apps/${app.id}/access`, {
+                default_role: defaultRole.value, members: members.map(m => ({ user_id: m.user_id, role: m.role })),
+              });
+              toast('アクセス権を保存しました'); route();
+            } catch (err) { toast(err.message); }
+          },
+        }, 'アクセス権を保存'))),
     h('div', { class: 'panel' },
       h('h2', {}, 'アプリの基本情報'),
       h('div', { class: 'form-field' }, h('label', {}, 'アプリ名'), name),

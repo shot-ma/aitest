@@ -2,11 +2,30 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+ADMIN = {"username": "admin", "display_name": "管理者", "password": "password1"}
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    """初期設定を済ませ、システム管理者としてログインしたクライアント。"""
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/test.db")
+    import app.main as m
+    m._login_failures.clear()
+    c = TestClient(m.app)
+    assert c.post("/api/auth/setup", json=ADMIN).status_code == 200
+    return c
+
+
+def new_user(admin, username, display_name, role="user"):
+    """管理者にユーザーを作らせ、そのユーザーでログインしたクライアントを返す。"""
     from app.main import app
-    return TestClient(app)
+    r = admin.post("/api/users", json={"username": username, "display_name": display_name,
+                                       "password": "password1", "role": role})
+    assert r.status_code == 201, r.text
+    c = TestClient(app)
+    assert c.post("/api/auth/login", json={"username": username, "password": "password1"}).status_code == 200
+    c.user_id = r.json()["id"]
+    return c
 
 
 @pytest.fixture
@@ -148,38 +167,31 @@ def test_csv_import_sjis_and_errors(client, inquiry):
 
 # ---------- コメント・通知・添付ファイル・参照 ----------
 
-from urllib.parse import quote
-
-
-def as_user(name):
-    return {"X-User-Name": quote(name)}
-
-
 def test_comments_and_notifications(client, inquiry):
-    app_id, ids = inquiry  # 作成者「ゲスト」は自動でフォロー中
+    app_id, ids = inquiry  # 作成者（管理者）は自動でフォロー中
     base = f"/api/apps/{app_id}"
-    sato, tanaka = as_user("佐藤"), as_user("田中")
+    sato, tanaka = new_user(client, "sato", "佐藤"), new_user(client, "tanaka", "田中")
     values = {ids["件名"]: "x", ids["受付日"]: "2026-11-01", ids["状況"]: "未対応"}
 
-    rid = client.post(f"{base}/records", json={"data": values}, headers=sato).json()["id"]
+    rid = sato.post(f"{base}/records", json={"data": values}).json()["id"]
     n = client.get("/api/notifications").json()
     assert n["unread"] == 1 and "佐藤 さんがレコード No.1 を登録" in n["items"][0]["message"]
-    assert client.get("/api/notifications", headers=sato).json()["unread"] == 0  # 本人には届かない
+    assert sato.get("/api/notifications").json()["unread"] == 0  # 本人には届かない
 
-    # 田中がコメント → フォロー中のゲストと、レコード作成者の佐藤に届く
-    c = client.post(f"{base}/records/{rid}/comments", json={"body": " 確認します "}, headers=tanaka)
-    assert c.status_code == 201 and c.json()["body"] == "確認します"
-    assert client.get("/api/notifications", headers=sato).json()["items"][0]["record_id"] == rid
+    # 田中がコメント → フォロー中の管理者と、レコード作成者の佐藤に届く
+    c = tanaka.post(f"{base}/records/{rid}/comments", json={"body": " 確認します "})
+    assert c.status_code == 201 and c.json()["body"] == "確認します" and c.json()["author"] == "田中"
+    assert sato.get("/api/notifications").json()["items"][0]["record_id"] == rid
     assert client.get("/api/notifications").json()["unread"] == 2
     # 佐藤が返信 → 以前コメントした田中にも届く
-    client.post(f"{base}/records/{rid}/comments", json={"body": "お願いします"}, headers=sato)
-    assert client.get("/api/notifications", headers=tanaka).json()["unread"] == 1
+    c2 = sato.post(f"{base}/records/{rid}/comments", json={"body": "お願いします"}).json()
+    assert tanaka.get("/api/notifications").json()["unread"] == 1
 
     assert client.get(f"{base}/records").json()["records"][0]["comment_count"] == 2
-    assert [x["author"] for x in client.get(f"{base}/records/{rid}/comments").json()] == ["田中", "佐藤"]
     cid = c.json()["id"]
-    assert client.delete(f"{base}/records/{rid}/comments/{cid}", headers=sato).status_code == 403
-    assert client.delete(f"{base}/records/{rid}/comments/{cid}", headers=tanaka).status_code == 204
+    assert sato.delete(f"{base}/records/{rid}/comments/{cid}").status_code == 403  # 他人のコメント
+    assert tanaka.delete(f"{base}/records/{rid}/comments/{cid}").status_code == 204
+    assert client.delete(f"{base}/records/{rid}/comments/{c2['id']}").status_code == 204  # アプリ管理者は可
     assert client.post(f"{base}/records/{rid}/comments", json={"body": "  "}).status_code == 400
 
     # 既読化とフォロー解除
@@ -187,9 +199,15 @@ def test_comments_and_notifications(client, inquiry):
     assert client.get("/api/notifications").json()["unread"] == 0
     assert client.get(base).json()["following"] is True
     client.put(f"{base}/follow", json={"follow": False})
-    client.put(f"{base}/records/{rid}", json={"data": values}, headers=tanaka)
+    tanaka.put(f"{base}/records/{rid}", json={"data": values})
     assert client.get("/api/notifications").json()["unread"] == 0
-    assert client.get("/api/notifications", headers=sato).json()["unread"] == 2  # 作成者には届く
+    assert sato.get("/api/notifications").json()["unread"] == 2  # 作成者には届く
+
+    # アプリを見られなくなった人には通知しない
+    client.put(f"{base}/access", json={"default_role": "none", "members": [
+        {"user_id": tanaka.user_id, "role": "editor"}]})
+    tanaka.put(f"{base}/records/{rid}", json={"data": values})
+    assert sato.get("/api/notifications").json()["unread"] == 2
 
 
 def test_attachments(client, tmp_path):
@@ -269,7 +287,8 @@ def test_lookup(client):
 
     assert client.post(f"{base}/records", json={"data": {lk: 9999}}).status_code == 422
     rec = client.post(f"{base}/records", json={"data": {t: "導入", lk: c1["id"]}}).json()
-    assert rec["refs"][lk] == {"id": c1["id"], "app_id": cust["id"], "label": "青空商事"}
+    assert rec["refs"][lk] == {"id": c1["id"], "app_id": cust["id"], "label": "青空商事",
+                               "restricted": False}
     client.post(f"{base}/records", json={"data": {t: "更新", lk: {"id": c2["id"]}}})
 
     # 参照先を書き換えると表示も追従する
@@ -313,6 +332,184 @@ def test_migrates_old_database(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db}")
     from app.main import app
     c = TestClient(app)
+    assert c.get("/api/auth/state").json() == {"setup_required": True, "user": None}
+    c.post("/api/auth/setup", json=ADMIN)
     rec = c.get("/api/apps/1/records").json()["records"][0]
     assert rec["data"] == {"1": "A"} and rec["comment_count"] == 0
-    assert c.put("/api/apps/1/records/1", json={"data": {"1": "B"}}).json()["updated_by"] == "ゲスト"
+    assert c.put("/api/apps/1/records/1", json={"data": {"1": "B"}}).json()["updated_by"] == "管理者"
+    # 既存アプリは全員が編集でき、管理はシステム管理者が行う
+    u = new_user(c, "ippan", "一般")
+    assert u.get("/api/apps/1").json()["role"] == "editor"
+
+
+# ---------- ログインと権限 ----------
+
+def test_auth_flow(client):
+    from app.main import app
+    anon = TestClient(app)
+    for path in ("/api/apps", "/api/meta", "/api/notifications", "/api/files/1", "/api/apps/1/export.csv"):
+        assert anon.get(path).status_code == 401
+    assert anon.post("/api/apps", json={"name": "x"}).status_code == 401
+    assert anon.get("/api/auth/state").json() == {"setup_required": False, "user": None}
+    assert anon.post("/api/auth/setup", json={**ADMIN, "username": "evil"}).status_code == 403  # 初期設定は一度だけ
+
+    # ユーザー作成の入力チェック
+    bad = lambda **kw: client.post("/api/users", json={"username": "taro", "display_name": "太郎",
+                                                       "password": "password1", **kw}).status_code
+    assert bad(password="short") == 400
+    assert bad(username="a b") == 400
+    assert bad(username="ADMIN") == 400  # 大文字小文字違いの重複
+    assert bad(role="root") == 400
+
+    taro = new_user(client, "taro", "太郎")
+    assert taro.get("/api/auth/state").json()["user"] == {
+        "id": taro.user_id, "username": "taro", "display_name": "太郎", "role": "user"}
+    assert "password" not in str(client.get("/api/users").json())
+    assert taro.get("/api/users").status_code == 403
+    assert taro.post("/api/users", json={"username": "x12", "display_name": "x", "password": "password1"}).status_code == 403
+    assert taro.put(f"/api/users/{taro.user_id}", json={"display_name": "太郎", "role": "admin", "active": True}).status_code == 403
+
+    # パスワード変更: 現在のパスワードが必要。他の端末のログインは切れる
+    other = TestClient(app)
+    other.post("/api/auth/login", json={"username": "taro", "password": "password1"})
+    assert taro.put("/api/auth/password", json={"current": "wrong", "new": "newpassword"}).status_code == 400
+    assert taro.put("/api/auth/password", json={"current": "password1", "new": "short"}).status_code == 400
+    assert taro.put("/api/auth/password", json={"current": "password1", "new": "newpassword"}).status_code == 204
+    assert taro.get("/api/apps").status_code == 200
+    assert other.get("/api/apps").status_code == 401
+    assert other.post("/api/auth/login", json={"username": "taro", "password": "password1"}).status_code == 401
+    assert other.post("/api/auth/login", json={"username": "Taro ", "password": "newpassword"}).status_code == 200
+
+    assert taro.put("/api/auth/profile", json={"display_name": "山田太郎"}).json()["display_name"] == "山田太郎"
+
+    # ログアウト、無効化
+    assert other.post("/api/auth/logout").status_code == 204
+    assert other.get("/api/apps").status_code == 401
+    upd = lambda uid, **kw: client.put(f"/api/users/{uid}", json={"display_name": "太郎", "role": "user", "active": True, **kw})
+    assert upd(taro.user_id, active=False).status_code == 200
+    assert taro.get("/api/apps").status_code == 401
+    assert other.post("/api/auth/login", json={"username": "taro", "password": "newpassword"}).status_code == 401
+    # 管理者によるパスワード再設定
+    assert upd(taro.user_id, password="resetpass1").status_code == 200
+    assert other.post("/api/auth/login", json={"username": "taro", "password": "resetpass1"}).status_code == 200
+    # 最後の管理者は降格も無効化もできない
+    admin_id = client.get("/api/auth/state").json()["user"]["id"]
+    assert upd(admin_id).status_code == 400
+    assert upd(admin_id, role="admin", active=False).status_code == 400
+    assert upd(taro.user_id, role="admin").status_code == 200
+    assert upd(admin_id).status_code == 200
+
+
+def test_login_throttle_and_origin(client):
+    from app.main import app
+    c = TestClient(app)
+    wrong = lambda: c.post("/api/auth/login", json={"username": "admin", "password": "x"}).status_code
+    assert [wrong() for _ in range(5)] == [401] * 5
+    assert wrong() == 429
+    assert c.post("/api/auth/login", json={"username": "admin", "password": "password1"}).status_code == 429
+    # 他サイトからの書き込みは拒否、同一サイトは許可
+    assert client.post("/api/apps", json={"name": "x"}, headers={"Origin": "https://evil.example"}).status_code == 403
+    assert client.post("/api/apps", json={"name": "x"}, headers={"Origin": "http://testserver"}).status_code == 201
+
+
+def test_app_permissions(client):
+    owner = new_user(client, "owner", "持ち主")
+    viewer, editor, outsider = (new_user(client, n, n) for n in ("viewer", "editor", "outsider"))
+    a = owner.post("/api/apps", json={"name": "案件", "template": "inquiries"}).json()
+    assert a["role"] == "manager"
+    base = f"/api/apps/{a['id']}"
+    ids = {f["label"]: str(f["id"]) for f in a["fields"]}
+    values = {ids["件名"]: "x", ids["受付日"]: "2026-11-01", ids["状況"]: "未対応"}
+    rid = owner.post(f"{base}/records", json={"data": values}).json()["id"]
+
+    # 既定は全員が編集可。設定は管理者だけ
+    assert outsider.get(base).json()["role"] == "editor"
+    assert outsider.put(base, json={"name": "乗っ取り"}).status_code == 403
+    assert outsider.get(f"{base}/access").status_code == 403
+
+    # 自分の管理権限は外せない / 不正な値は拒否
+    put = lambda who, default, members: who.put(f"{base}/access", json={"default_role": default, "members": members})
+    me = {"user_id": owner.user_id, "role": "manager"}
+    assert put(owner, "none", []).status_code == 400
+    assert put(owner, "manager", [me]).status_code == 400
+    assert put(owner, "none", [me, {"user_id": 9999, "role": "viewer"}]).status_code == 400
+    r = put(owner, "none", [me, {"user_id": viewer.user_id, "role": "viewer"},
+                            {"user_id": editor.user_id, "role": "editor"}])
+    assert r.status_code == 200 and len(r.json()["members"]) == 3
+
+    # 権限のない人: 一覧に出ず、存在も分からない
+    assert [x["id"] for x in outsider.get("/api/apps").json()] == []
+    for call in (outsider.get(base), outsider.get(f"{base}/records"), outsider.get(f"{base}/export.csv"),
+                 outsider.post(f"{base}/records", json={"data": values}),
+                 outsider.get(f"{base}/records/{rid}/comments"), outsider.put(f"{base}/follow", json={"follow": True})):
+        assert call.status_code == 404
+
+    # 閲覧のみ: 読めるが書けない
+    assert viewer.get(base).json()["role"] == "viewer"
+    assert viewer.get(f"{base}/records").json()["total"] == 1
+    assert viewer.get(f"{base}/aggregate", params={"group": ids["状況"]}).status_code == 200
+    assert viewer.get(f"{base}/export.csv").status_code == 200
+    for call in (viewer.post(f"{base}/records", json={"data": values}),
+                 viewer.put(f"{base}/records/{rid}", json={"data": values}),
+                 viewer.delete(f"{base}/records/{rid}"),
+                 viewer.post(f"{base}/records/{rid}/comments", json={"body": "x"}),
+                 viewer.post(f"{base}/import", files={"file": ("a.csv", "件名\nx\n".encode(), "text/csv")}),
+                 viewer.put(f"{base}/fields", json={"fields": []}),
+                 viewer.delete(base)):
+        assert call.status_code == 403
+
+    # 編集可: レコードとコメントは扱えるが、項目・権限・アプリ削除は不可
+    assert editor.put(f"{base}/records/{rid}", json={"data": values}).status_code == 200
+    assert editor.post(f"{base}/records/{rid}/comments", json={"body": "x"}).status_code == 201
+    for call in (editor.put(f"{base}/fields", json={"fields": []}), editor.get(f"{base}/access"),
+                 editor.put(f"{base}/access", json={"default_role": "editor", "members": []}),
+                 editor.delete(base)):
+        assert call.status_code == 403
+
+    # システム管理者は全アプリを管理できる。アプリ管理者は削除できる
+    assert client.get(base).json()["role"] == "manager"
+    assert put(client, "viewer", []).status_code == 200
+    assert outsider.get(base).json()["role"] == "viewer"
+    assert owner.get(base).json()["role"] == "viewer"
+    put(client, "none", [me])
+    assert owner.delete(base).status_code == 204
+
+
+def test_permissions_on_files_and_lookups(client):
+    member = new_user(client, "member", "メンバー")
+    outsider = new_user(client, "outsider", "部外者")
+    # 顧客アプリ（限定公開）と、それを参照する案件アプリ（全員編集可）
+    cust = client.post("/api/apps", json={"name": "顧客", "template": "customers"}).json()
+    company = next(f for f in cust["fields"] if f["label"] == "会社名")
+    cbase = f"/api/apps/{cust['id']}"
+    fields = client.put(f"{cbase}/fields", json={"fields": [
+        {"id": company["id"], "label": "会社名", "type": "text"}, {"label": "契約書", "type": "file"}]}).json()
+    up = client.post(f"{cbase}/fields/{fields[1]['id']}/files", files={"file": ("秘密.txt", b"secret")}).json()
+    c1 = client.post(f"{cbase}/records", json={"data": {str(company["id"]): "青空商事", str(fields[1]["id"]): [up["id"]]}}).json()
+    client.put(f"{cbase}/access", json={"default_role": "none", "members": [{"user_id": member.user_id, "role": "viewer"}]})
+
+    deals = client.post("/api/apps", json={"name": "案件"}).json()
+    dbase = f"/api/apps/{deals['id']}"
+    lookup = {"label": "顧客", "type": "lookup", "config": {"app_id": cust["id"], "field_id": company["id"]}}
+    lk = str(client.put(f"{dbase}/fields", json={"fields": [lookup]}).json()[0]["id"])
+    rec = member.post(f"{dbase}/records", json={"data": {lk: c1["id"]}}).json()
+
+    # 添付ファイル: 閲覧権限のある人だけがダウンロード・アップロードできる
+    assert member.get(f"/api/files/{up['id']}").content == b"secret"
+    assert outsider.get(f"/api/files/{up['id']}").status_code == 404
+    assert member.post(f"{cbase}/fields/{fields[1]['id']}/files", files={"file": ("a", b"a")}).status_code == 403
+    assert outsider.post(f"{cbase}/fields/{fields[1]['id']}/files", files={"file": ("a", b"a")}).status_code == 404
+
+    # 参照: 参照先を見られない人には内容を出さず、候補検索も新しい値の設定もできない
+    assert member.get(f"{dbase}/records/{rec['id']}").json()["refs"][lk]["label"] == "青空商事"
+    hidden = outsider.get(f"{dbase}/records/{rec['id']}").json()["refs"][lk]
+    assert hidden["label"] is None and hidden["restricted"] is True
+    assert "青空商事" not in outsider.get(f"{dbase}/export.csv").text
+    assert outsider.get(f"{dbase}/aggregate", params={"group": lk}).json()["groups"][0]["key"] == "（権限なし）"
+    assert outsider.get(f"{dbase}/fields/{lk}/candidates").status_code == 403
+    assert outsider.post(f"{dbase}/records", json={"data": {lk: c1["id"]}}).status_code == 422
+    assert outsider.put(f"{dbase}/records/{rec['id']}", json={"data": {lk: c1["id"]}}).status_code == 200  # 既存値の維持は可
+
+    # 参照先を見られない人は、そのアプリを参照する項目を作れない
+    own = outsider.post("/api/apps", json={"name": "自分用"}).json()
+    assert outsider.put(f"/api/apps/{own['id']}/fields", json={"fields": [lookup]}).status_code == 400

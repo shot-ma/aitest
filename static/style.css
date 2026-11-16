@@ -190,3 +190,13 @@ dialog form { display: flex; flex-direction: column; max-height: calc(100vh - 42
 .comments textarea { margin: 10px 0 8px; }
 a.file { display: inline-block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; margin-right: 8px; }
 .lookup-results { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; max-height: 140px; overflow-y: auto; }
+
+/* ログイン・権限 */
+.topbar #bell, .topbar #userBtn { display: none; }
+body.signed-in .topbar #bell, body.signed-in .topbar #userBtn { display: inline-block; }
+.auth { max-width: 380px; margin: 48px auto 0; padding: 24px; }
+.auth h1 { margin-bottom: 14px; }
+.auth .error { margin-bottom: 10px; min-height: 1.3em; }
+fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; }
+.member { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.member-name { flex: 1; min-width: 160px; }
