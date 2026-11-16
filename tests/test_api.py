@@ -577,3 +577,90 @@ def test_views(client, inquiry):
     assert client.delete(f"{base}/views/{v1}").status_code == 404
     other = client.post("/api/apps", json={"name": "別"}).json()
     assert client.delete(f"/api/apps/{other['id']}/views/{v2}").status_code == 404  # 別アプリ経由では消せない
+
+
+def test_field_permissions(client, tmp_path):
+    """閲覧を制限した項目は、権限のない人にはどの経路でも返さない。"""
+    sato, tanaka = new_user(client, "sato", "佐藤"), new_user(client, "tanaka", "田中")
+    a = client.post("/api/apps", json={"name": "社員"}).json()
+    base = f"/api/apps/{a['id']}"
+    only_sato = {"access": "restricted", "user_ids": [sato.user_id]}
+    spec = [{"label": "氏名", "type": "text", "required": True},
+            {"label": "年収", "type": "number", "required": True, **only_sato},
+            {"label": "評価", "type": "select", "options": ["A", "B"], **only_sato},
+            {"label": "査定メモ", "type": "text", **only_sato},
+            {"label": "契約書", "type": "file", **only_sato},
+            {"label": "入社日", "type": "date"}]
+    assert client.put(f"{base}/fields", json={"fields": [{**spec[0], "access": "x"}]}).status_code == 400
+    assert client.put(f"{base}/fields", json={"fields": [{**spec[1], "user_ids": [9999]}]}).status_code == 400
+    fields = client.put(f"{base}/fields", json={"fields": spec}).json()
+    assert fields[1]["access"] == "restricted" and fields[1]["user_ids"] == [sato.user_id]
+    name, salary, grade, memo, doc, joined = (str(f["id"]) for f in fields)
+    up = client.post(f"{base}/fields/{doc}/files", files={"file": ("契約.txt", b"secret")}).json()
+    rec = client.post(f"{base}/records", json={"data": {
+        name: "山田", salary: 5000000, grade: "A", memo: "昇格候補", doc: [up["id"]], joined: "2020-04-01"}}).json()
+    url = f"{base}/records/{rec['id']}"
+
+    # アプリ情報: 権限のない人には項目自体を返さない。公開範囲の設定は管理者にだけ返す
+    assert [f["label"] for f in tanaka.get(base).json()["fields"]] == ["氏名", "入社日"]
+    sato_fields = sato.get(base).json()["fields"]
+    assert len(sato_fields) == 6 and "user_ids" not in sato_fields[1] and "access" not in sato_fields[1]
+    assert "user_ids" in client.get(base).json()["fields"][1]
+
+    # レコード: 値を返さない
+    assert tanaka.get(url).json()["data"] == {name: "山田", joined: "2020-04-01"}
+    assert tanaka.get(f"{base}/records").json()["records"][0]["data"] == {name: "山田", joined: "2020-04-01"}
+    assert sato.get(url).json()["data"][salary] == 5000000
+
+    # 検索・絞り込み・並び替え・集計・CSV・添付からも漏れない
+    total = lambda who, **p: who.get(f"{base}/records", params=p).json()["total"]
+    assert total(sato, q="昇格") == 1 and total(tanaka, q="昇格") == 0
+    assert total(sato, q="契約.txt") == 1 and total(tanaka, q="契約.txt") == 0
+    assert total(tanaka, q="5000000") == 0 and total(tanaka, q="山田") == 1
+    assert total(sato, **{f"f_{grade}": "B"}) == 0 and total(tanaka, **{f"f_{grade}": "B"}) == 1  # 絞り込みは無視される
+    assert tanaka.get(f"{base}/aggregate", params={"group": grade}).status_code == 400
+    assert tanaka.get(f"{base}/aggregate", params={"group": joined, "sum": salary}).status_code == 400
+    assert sato.get(f"{base}/aggregate", params={"group": grade, "sum": salary}).json()["groups"][0]["sum"] == 5000000
+    csv_text = tanaka.get(f"{base}/export.csv").text
+    assert "年収" not in csv_text and "5000000" not in csv_text and "昇格候補" not in csv_text and "山田" in csv_text
+    assert "5000000" in sato.get(f"{base}/export.csv").text
+    assert sato.get(f"/api/files/{up['id']}").content == b"secret"
+    assert tanaka.get(f"/api/files/{up['id']}").status_code == 404
+    assert tanaka.post(f"{base}/fields/{doc}/files", files={"file": ("a", b"a")}).status_code == 404
+
+    # 編集: 見えない項目は書き換えられず、今の値が保たれる（添付ファイルも消えない）
+    r = tanaka.put(url, json={"data": {name: "山田太郎", joined: "2020-04-01", salary: 1, grade: "B", doc: []}})
+    assert r.status_code == 200 and r.json()["data"] == {name: "山田太郎", joined: "2020-04-01"}
+    kept = client.get(url).json()["data"]
+    assert kept[name] == "山田太郎" and kept[salary] == 5000000 and kept[grade] == "A" and kept[doc][0]["id"] == up["id"]
+    assert len(list((tmp_path / "uploads").iterdir())) == 1
+    # 新規登録: 見えない必須項目は空のまま登録できる。CSV 取り込みでも見えない列は無視される
+    new = tanaka.post(f"{base}/records", json={"data": {name: "新人", salary: 999}})
+    assert new.status_code == 201 and salary not in client.get(f"{base}/records/{new.json()['id']}").json()["data"]
+    imp = tanaka.post(f"{base}/import", files={"file": ("a.csv", "氏名,年収\n鈴木,123\n".encode(), "text/csv")}).json()
+    assert imp == {"imported": 1, "errors": []}
+    assert total(client, q="123") == 0
+    assert sato.post(f"{base}/records", json={"data": {name: "x"}}).status_code == 422  # 見える人には必須
+
+    # ビュー: 見えない項目は列や絞り込みから外れる
+    client.post(f"{base}/views", json={"name": "v", "type": "table", "config": {
+        "columns": [int(name), int(salary)], "sort": salary, "filters": {grade: "A"}}})
+    assert tanaka.get(base).json()["views"][0]["config"] == {
+        "columns": [int(name)], "sort": "id", "order": "desc", "filters": {}}
+    assert sato.get(base).json()["views"][0]["config"]["columns"] == [int(name), int(salary)]
+
+    # 他アプリからの参照: 表示項目が見えない人には内容を出さない
+    other = client.post("/api/apps", json={"name": "面談"}).json()
+    obase = f"/api/apps/{other['id']}"
+    lk = str(client.put(f"{obase}/fields", json={"fields": [{"label": "査定", "type": "lookup", "config": {
+        "app_id": a["id"], "field_id": int(memo)}}]}).json()[0]["id"])
+    orec = client.post(f"{obase}/records", json={"data": {lk: rec["id"]}}).json()
+    assert sato.get(f"{obase}/records/{orec['id']}").json()["refs"][lk]["label"] == "昇格候補"
+    hidden = tanaka.get(f"{obase}/records/{orec['id']}").json()["refs"][lk]
+    assert hidden["label"] is None and hidden["restricted"] is True
+    assert tanaka.get(f"{obase}/fields/{lk}/candidates").status_code == 403
+    assert "昇格候補" not in tanaka.get(f"{obase}/export.csv").text
+
+    # 制限を外すと見えるようになる
+    client.put(f"{base}/fields", json={"fields": [{**f, "access": "all", "user_ids": []} for f in fields]})
+    assert tanaka.get(url).json()["data"][salary] == 5000000

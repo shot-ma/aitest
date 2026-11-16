@@ -106,7 +106,13 @@ CREATE TABLE IF NOT EXISTS fields (
     required INTEGER NOT NULL DEFAULT 0,
     options TEXT NOT NULL DEFAULT '[]',
     position INTEGER NOT NULL DEFAULT 0,
-    config TEXT NOT NULL DEFAULT '{}'
+    config TEXT NOT NULL DEFAULT '{}',
+    access TEXT NOT NULL DEFAULT 'all'  -- all（アプリを見られる全員）/ restricted（指定ユーザーのみ閲覧可）
+);
+CREATE TABLE IF NOT EXISTS field_members (
+    field_id INTEGER NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (field_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +204,7 @@ CREATE INDEX IF NOT EXISTS idx_user_notifications ON user_notifications(user_id,
 # 旧バージョンの DB に不足している列（テーブル, 列, 定義）
 MIGRATIONS = [
     ("fields", "config", "TEXT NOT NULL DEFAULT '{}'"),
+    ("fields", "access", "TEXT NOT NULL DEFAULT 'all'"),
     ("records", "created_by", "TEXT NOT NULL DEFAULT ''"),
     ("records", "updated_by", "TEXT NOT NULL DEFAULT ''"),
     ("records", "created_by_id", "INTEGER"),
@@ -298,6 +305,8 @@ class FieldIn(BaseModel):
     required: bool = False
     options: list[str] = []
     config: dict = {}
+    access: str = "all"       # restricted なら user_ids の人とアプリ管理者だけが閲覧できる
+    user_ids: list[int] = []
 
 
 class AppIn(BaseModel):
@@ -411,15 +420,48 @@ def can_view(conn, app_id, user: dict) -> bool:
 def app_detail(conn, app_id: int, user: dict) -> dict:
     following = conn.execute("SELECT 1 FROM app_followers WHERE app_id = ? AND user_id = ?",
                              (app_id, user["id"])).fetchone()
-    a, fields = get_app(conn, app_id, user), get_fields(conn, app_id)
+    a = get_app(conn, app_id, user)
+    fields, _ = split_fields(a, user, get_fields(conn, app_id))
+    if a["role"] != "manager":  # 誰が閲覧できるかの設定は管理者にだけ返す
+        fields = [{k: v for k, v in f.items() if k not in ("access", "user_ids")} for f in fields]
     return {**a, "fields": fields, "views": get_views(conn, a, user, fields),
             "following": bool(following)}
 
 
 def get_fields(conn, app_id: int) -> list[dict]:
+    """アプリの全項目（閲覧権限で絞る前）。user_ids は閲覧を許可されたユーザー。"""
     rows = conn.execute(
-        "SELECT * FROM fields WHERE app_id = ? ORDER BY position, id", (app_id,))
-    return [field_row(r) for r in rows]
+        "SELECT * FROM fields WHERE app_id = ? ORDER BY position, id", (app_id,)).fetchall()
+    members: dict[int, list[int]] = {}
+    for m in conn.execute("SELECT m.field_id, m.user_id FROM field_members m "
+                          "JOIN fields f ON f.id = m.field_id WHERE f.app_id = ?", (app_id,)):
+        members.setdefault(m["field_id"], []).append(m["user_id"])
+    return [{**field_row(r), "user_ids": members.get(r["id"], [])} for r in rows]
+
+
+def split_fields(app: dict, user: dict, fields: list[dict]) -> tuple[list[dict], list[str]]:
+    """項目を「このユーザーが閲覧できるもの」と「できないもののキー」に分ける。
+
+    閲覧できない項目は、値を返さず、検索・絞り込み・並び替え・集計・CSV の対象からも外す。
+    """
+    if app["role"] == "manager":
+        return fields, []
+    visible = [f for f in fields if f["access"] == "all" or user["id"] in f["user_ids"]]
+    return visible, [str(f["id"]) for f in fields if f not in visible]
+
+
+def lookup_restricted(conn, cfg: dict, user: dict) -> bool:
+    """参照先のアプリか表示項目をこのユーザーが閲覧できないとき True（参照先が無ければ False）。"""
+    row = conn.execute("SELECT * FROM apps WHERE id = ?", (cfg.get("app_id"),)).fetchone()
+    if not row:
+        return False
+    role = app_role(conn, dict(row), user)
+    if role in ("none", "manager"):
+        return role == "none"
+    f = conn.execute("SELECT access FROM fields WHERE id = ?", (cfg.get("field_id"),)).fetchone()
+    return bool(f) and f["access"] == "restricted" and not conn.execute(
+        "SELECT 1 FROM field_members WHERE field_id = ? AND user_id = ?",
+        (cfg.get("field_id"), user["id"])).fetchone()
 
 
 def clean_view_config(vtype: str, config: dict, fields: list[dict], strict: bool) -> dict:
@@ -537,22 +579,22 @@ def ref_labels(conn, f: dict, ids) -> dict[int, str]:
     return {r["id"]: f"No.{r['id']}" if r["v"] in (None, "") else str(r["v"]) for r in rows}
 
 
-def present(conn, fields: list[dict], rows, user: dict) -> list[dict]:
+def present(conn, fields: list[dict], rows, user: dict, hidden=()) -> list[dict]:
     """DB の行を API の形にする。参照項目の表示名は refs にまとめて付ける。"""
     recs = []
     for row in rows:
         d = dict(row)
         d["data"] = json.loads(d["data"])
+        for key in hidden:  # 閲覧できない項目の値は返さない
+            d["data"].pop(key, None)
         d["refs"] = {}
         recs.append(d)
     for f in fields:
         if f["type"] != "lookup":
             continue
         key = str(f["id"])
-        target = conn.execute("SELECT * FROM apps WHERE id = ?",
-                              (f["config"].get("app_id"),)).fetchone()
-        # 参照先アプリを閲覧できない人には、参照先の内容を見せない
-        restricted = bool(target) and app_role(conn, dict(target), user) == "none"
+        # 参照先のアプリや表示項目を閲覧できない人には、参照先の内容を見せない
+        restricted = lookup_restricted(conn, f["config"], user)
         labels = {} if restricted else ref_labels(
             conn, f, {r["data"][key] for r in recs if key in r["data"]})
         for r in recs:
@@ -618,6 +660,9 @@ def clean_fields(items: list[FieldIn]) -> list[FieldIn]:
             f.options = []
         if f.type != "lookup":
             f.config = {}
+        if f.access not in ("all", "restricted"):
+            raise HTTPException(400, f"「{f.label}」の閲覧できる人の設定が正しくありません")
+        f.user_ids = list(dict.fromkeys(f.user_ids)) if f.access == "restricted" else []
     return items
 
 
@@ -647,11 +692,16 @@ ERROR_MESSAGES = {
 
 
 def validate_record(conn, app_id: int, fields: list[dict], data: dict, user: dict,
-                    record_id: int | None = None, old: dict | None = None) -> dict:
+                    record_id: int | None = None, old: dict | None = None, hidden=()) -> dict:
     """入力値を項目の型に合わせて検証・正規化する。エラー時は 422 を返す。"""
     cleaned, errors = {}, {}
     for f in fields:
         key, t = str(f["id"]), f["type"]
+        if key in hidden:
+            # 閲覧できない項目は編集もできない。更新時は今の値を保ち、新規登録時は空のままにする
+            if old and key in old:
+                cleaned[key] = old[key]
+            continue
         v = data.get(key)
         if isinstance(v, str):
             v = v.strip()
@@ -722,15 +772,22 @@ def validate_record(conn, app_id: int, fields: list[dict], data: dict, user: dic
     return cleaned
 
 
-def build_where(app_id: int, fields: list[dict], params) -> tuple[str, list]:
-    """検索語（q）と項目ごとの絞り込み（f_<項目ID>）から WHERE 句を作る。"""
+def build_where(app_id: int, fields: list[dict], params, hidden=()) -> tuple[str, list]:
+    """検索語（q）と項目ごとの絞り込み（f_<項目ID>）から WHERE 句を作る。
+
+    fields には閲覧できる項目だけを、hidden には閲覧できない項目のキーを渡す。
+    """
     where, args = ["app_id = ?"], [app_id]
     q = (params.get("q") or "").strip()
     if q:
-        where.append("EXISTS (SELECT 1 FROM json_tree(records.data) "
-                     "WHERE atom LIKE ? ESCAPE '\\')")
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        args.append(f"%{esc}%")
+        # 閲覧できない項目の値は検索対象から外す（検索結果から中身を推測できないように）
+        skip = f" AND e.key NOT IN ({marks(hidden)})" if hidden else ""
+        where.append(
+            "EXISTS (SELECT 1 FROM json_each(records.data) e WHERE "
+            "(e.atom LIKE ? ESCAPE '\\' OR (e.type IN ('array', 'object') AND EXISTS "
+            "(SELECT 1 FROM json_tree(e.value) t WHERE t.atom LIKE ? ESCAPE '\\')))" + skip + ")")
+        args += [f"%{esc}%", f"%{esc}%", *hidden]
     for f in fields:
         path = f'$."{f["id"]}"'  # 項目IDは整数なので SQL に埋め込んでも安全
         if f["type"] == "date":
@@ -1106,18 +1163,26 @@ def replace_fields(app_id: int, body: FieldsIn, user: User):
                 keep.add(f.id)
             if f.type == "lookup":
                 check_lookup(conn, f, existing.get(f.id), user)
+            if f.user_ids and conn.execute(
+                    f"SELECT COUNT(*) FROM users WHERE id IN ({marks(f.user_ids)})",
+                    f.user_ids).fetchone()[0] != len(f.user_ids):
+                raise HTTPException(400, f"「{f.label}」: 存在しないユーザーが含まれています")
             opts = json.dumps(f.options, ensure_ascii=False)
             config = json.dumps(f.config)
             if f.id is None:
-                conn.execute(
+                f.id = conn.execute(
                     "INSERT INTO fields (app_id, label, type, required, options, position, "
-                    "config) VALUES (?,?,?,?,?,?,?)",
-                    (app_id, f.label, f.type, int(f.required), opts, pos, config))
+                    "config, access) VALUES (?,?,?,?,?,?,?,?)",
+                    (app_id, f.label, f.type, int(f.required), opts, pos, config,
+                     f.access)).lastrowid
             else:
                 conn.execute(
                     "UPDATE fields SET label = ?, required = ?, options = ?, position = ?, "
-                    "config = ? WHERE id = ?",
-                    (f.label, int(f.required), opts, pos, config, f.id))
+                    "config = ?, access = ? WHERE id = ?",
+                    (f.label, int(f.required), opts, pos, config, f.access, f.id))
+            conn.execute("DELETE FROM field_members WHERE field_id = ?", (f.id,))
+            conn.executemany("INSERT INTO field_members (field_id, user_id) VALUES (?,?)",
+                             [(f.id, uid) for uid in f.user_ids])
         for fid in existing.keys() - keep:
             remove_files(conn, "field_id = ?", [fid])
             conn.execute("DELETE FROM fields WHERE id = ?", (fid,))
@@ -1130,14 +1195,14 @@ def replace_fields(app_id: int, body: FieldsIn, user: User):
 def lookup_candidates(app_id: int, field_id: int, user: User, q: str = ""):
     """参照項目の入力時に、参照先アプリのレコードを検索して候補を返す。"""
     with connect() as conn:
-        get_app(conn, app_id, user)
-        f = next((f for f in get_fields(conn, app_id)
+        a = get_app(conn, app_id, user)
+        f = next((f for f in split_fields(a, user, get_fields(conn, app_id))[0]
                   if f["id"] == field_id and f["type"] == "lookup"), None)
         if not f:
             raise HTTPException(404, "参照項目が見つかりません")
         cfg = f["config"]
-        if not can_view(conn, cfg["app_id"], user):
-            raise HTTPException(403, "参照先アプリを閲覧する権限がありません")
+        if lookup_restricted(conn, cfg, user):
+            raise HTTPException(403, "参照先を閲覧する権限がありません")
         esc = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = conn.execute(
             "SELECT id FROM records WHERE app_id = ? "
@@ -1155,9 +1220,9 @@ def list_records(app_id: int, request: Request, user: User, sort: str = "id",
                  order: str = "desc", page: int = 1, per_page: int = 20):
     page, per_page = max(page, 1), min(max(per_page, 1), 500)
     with connect() as conn:
-        get_app(conn, app_id, user)
-        fields = get_fields(conn, app_id)
-        where, args = build_where(app_id, fields, request.query_params)
+        a = get_app(conn, app_id, user)
+        fields, hidden = split_fields(a, user, get_fields(conn, app_id))
+        where, args = build_where(app_id, fields, request.query_params, hidden)
         sort_sql = "id"
         if sort in ("created_at", "updated_at"):
             sort_sql = sort
@@ -1174,15 +1239,16 @@ def list_records(app_id: int, request: Request, user: User, sort: str = "id",
             f"ORDER BY {sort_sql} {direction}, id DESC LIMIT ? OFFSET ?",
             [*args, per_page, (page - 1) * per_page]).fetchall()
         return {"total": total, "page": page, "per_page": per_page,
-                "records": present(conn, fields, rows, user)}
+                "records": present(conn, fields, rows, user, hidden)}
 
 
 @app.get("/api/apps/{app_id}/records/{record_id}")
 def read_record(app_id: int, record_id: int, user: User):
     with connect() as conn:
-        get_app(conn, app_id, user)
+        a = get_app(conn, app_id, user)
         row = get_record(conn, app_id, record_id)
-        return present(conn, get_fields(conn, app_id), [row], user)[0]
+        fields, hidden = split_fields(a, user, get_fields(conn, app_id))
+        return present(conn, fields, [row], user, hidden)[0]
 
 
 @app.post("/api/apps/{app_id}/records", status_code=201)
@@ -1191,7 +1257,8 @@ def create_record(app_id: int, body: RecordIn, user: User):
     with connect() as conn:
         a = get_app(conn, app_id, user, "editor")
         fields = get_fields(conn, app_id)
-        data = validate_record(conn, app_id, fields, body.data, user)
+        visible, hidden = split_fields(a, user, fields)
+        data = validate_record(conn, app_id, fields, body.data, user, hidden=hidden)
         ts = now()
         rid = conn.execute(
             "INSERT INTO records (app_id, data, created_at, updated_at, created_by, updated_by, "
@@ -1200,7 +1267,7 @@ def create_record(app_id: int, body: RecordIn, user: User):
              user["id"])).lastrowid
         sync_attachments(conn, rid, fields, data)
         notify(conn, a, rid, user, f"{name} さんがレコード No.{rid} を登録しました")
-        return present(conn, fields, [get_record(conn, app_id, rid)], user)[0]
+        return present(conn, visible, [get_record(conn, app_id, rid)], user, hidden)[0]
 
 
 @app.put("/api/apps/{app_id}/records/{record_id}")
@@ -1210,14 +1277,15 @@ def update_record(app_id: int, record_id: int, body: RecordIn, user: User):
         a = get_app(conn, app_id, user, "editor")
         old = get_record(conn, app_id, record_id)
         fields = get_fields(conn, app_id)
+        visible, hidden = split_fields(a, user, fields)
         data = validate_record(conn, app_id, fields, body.data, user, record_id,
-                               json.loads(old["data"]))
+                               json.loads(old["data"]), hidden)
         conn.execute("UPDATE records SET data = ?, updated_at = ?, updated_by = ? WHERE id = ?",
                      (json.dumps(data, ensure_ascii=False), now(), name, record_id))
         sync_attachments(conn, record_id, fields, data)
         notify(conn, a, record_id, user,
                f"{name} さんがレコード No.{record_id} を更新しました", [old["created_by_id"]])
-        return present(conn, fields, [get_record(conn, app_id, record_id)], user)[0]
+        return present(conn, visible, [get_record(conn, app_id, record_id)], user, hidden)[0]
 
 
 @app.delete("/api/apps/{app_id}/records/{record_id}", status_code=204)
@@ -1285,9 +1353,9 @@ def delete_comment(app_id: int, record_id: int, comment_id: int, user: User):
 async def upload_file(app_id: int, field_id: int, user: User, file: UploadFile = File(...)):
     """ファイルを仮アップロードする。レコード保存時にそのレコードへ紐付けられる。"""
     with connect() as conn:
-        get_app(conn, app_id, user, "editor")
-        if not conn.execute("SELECT 1 FROM fields WHERE id = ? AND app_id = ? AND type = 'file'",
-                            (field_id, app_id)).fetchone():
+        a = get_app(conn, app_id, user, "editor")
+        if not any(f["id"] == field_id and f["type"] == "file"
+                   for f in split_fields(a, user, get_fields(conn, app_id))[0]):
             raise HTTPException(404, "添付ファイル項目が見つかりません")
     stored = uuid.uuid4().hex
     path, size = upload_dir() / stored, 0
@@ -1317,9 +1385,13 @@ async def upload_file(app_id: int, field_id: int, user: User, file: UploadFile =
 def download_file(file_id: int, user: User):
     with connect() as conn:
         row = conn.execute("SELECT * FROM attachments WHERE id = ?", (file_id,)).fetchone()
-        # 権限がない場合も、存在を知らせないよう 404 にする
-        if not row or not can_view(conn, row["app_id"], user) \
-                or not (upload_dir() / row["stored"]).is_file():
+        # アプリや項目を閲覧できない場合も、存在を知らせないよう 404 にする
+        ok = bool(row) and can_view(conn, row["app_id"], user)
+        if ok:
+            a = get_app(conn, row["app_id"], user)
+            ok = any(f["id"] == row["field_id"]
+                     for f in split_fields(a, user, get_fields(conn, a["id"]))[0])
+        if not ok or not (upload_dir() / row["stored"]).is_file():
             raise HTTPException(404, "ファイルが見つかりません")
     # ブラウザ内で開かせず必ずダウンロードさせる（HTML 等をアップロードされても実行されない）
     return FileResponse(upload_dir() / row["stored"], filename=row["name"],
@@ -1354,8 +1426,8 @@ def read_notifications(user: User):
 def aggregate(app_id: int, group: int, user: User, sum: int | None = None):
     """group 項目の値ごとに件数（と sum 項目の合計）を集計する。"""
     with connect() as conn:
-        get_app(conn, app_id, user)
-        fields = {f["id"]: f for f in get_fields(conn, app_id)}
+        a = get_app(conn, app_id, user)
+        fields = {f["id"]: f for f in split_fields(a, user, get_fields(conn, app_id))[0]}
         if group not in fields or fields[group]["type"] == "file":
             raise HTTPException(400, "集計項目が正しくありません")
         if sum is not None and (sum not in fields or fields[sum]["type"] != "number"):
@@ -1388,10 +1460,10 @@ def aggregate(app_id: int, group: int, user: User, sum: int | None = None):
 def export_csv(app_id: int, request: Request, user: User):
     with connect() as conn:
         a = get_app(conn, app_id, user)
-        fields = get_fields(conn, app_id)
-        where, args = build_where(app_id, fields, request.query_params)
+        fields, hidden = split_fields(a, user, get_fields(conn, app_id))
+        where, args = build_where(app_id, fields, request.query_params, hidden)
         rows = conn.execute(f"SELECT * FROM records WHERE {where} ORDER BY id", args).fetchall()
-        recs = present(conn, fields, rows, user)
+        recs = present(conn, fields, rows, user, hidden)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["ID", *[f["label"] for f in fields], "作成日時", "更新日時"])
@@ -1423,8 +1495,9 @@ async def import_csv(app_id: int, user: User, file: UploadFile = File(...)):
     with connect() as conn:
         a = get_app(conn, app_id, user, "editor")
         fields = get_fields(conn, app_id)
-        # 添付ファイルは CSV では取り込めないので列を無視する
-        cols = {f["label"]: f for f in fields if f["type"] != "file"}
+        visible, hidden = split_fields(a, user, fields)
+        # 添付ファイルは CSV では取り込めないので列を無視する。閲覧できない項目の列も無視する
+        cols = {f["label"]: f for f in visible if f["type"] != "file"}
         if not any(h in cols for h in header):
             raise HTTPException(400, "1行目にアプリの項目名と一致する列がありません")
         imported, errors = 0, []
@@ -1448,10 +1521,10 @@ async def import_csv(app_id: int, user: User, file: UploadFile = File(...)):
                         "AND CAST(json_extract(data, ?) AS TEXT) = ? ORDER BY id LIMIT 1",
                         (f["config"].get("app_id"), f'$."{f["config"].get("field_id")}"',
                          cell)).fetchone()
-                    cell = hit["id"] if hit else -1
+                    cell = hit["id"] if hit and not lookup_restricted(conn, f["config"], user) else -1
                 data[str(f["id"])] = cell
             try:
-                cleaned = validate_record(conn, app_id, fields, data, user)
+                cleaned = validate_record(conn, app_id, fields, data, user, hidden=hidden)
             except HTTPException as e:
                 labels = {str(f["id"]): f["label"] for f in fields}
                 msg = "、".join(f"{labels[k]}: {m}" for k, m in e.detail["errors"].items())

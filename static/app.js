@@ -898,7 +898,8 @@ async function viewSettings(app, root) {
   const name = h('input', { class: 'wide', value: app.name, required: true, maxLength: 100 });
   const desc = h('input', { class: 'wide', value: app.description, maxLength: 500 });
   const icon = h('input', { value: app.icon, maxLength: 8, size: 4 });
-  const draft = app.fields.map(f => ({ ...f, config: { ...f.config }, optionsText: f.options.join('\n') }));
+  const directory = await api('GET', '/api/users/directory');
+  const draft = app.fields.map(f => ({ ...f, config: { ...f.config }, user_ids: [...f.user_ids], optionsText: f.options.join('\n') }));
   const list = h('div');
 
   function renderFields() {
@@ -916,6 +917,17 @@ async function viewSettings(app, root) {
         h('button', { class: 'icon danger', title: '項目を削除', onclick: () => { draft.splice(i, 1); renderFields(); } }, '✕')),
       CHOICE.includes(f.type) && h('div', { class: 'opts' },
         h('textarea', { value: f.optionsText, placeholder: '選択肢を1行に1つずつ入力', 'aria-label': '選択肢', oninput: e => { f.optionsText = e.target.value; } })),
+      // 項目ごとの閲覧権限。制限すると、指定した人とアプリ管理者以外にはこの項目が存在しないように見える
+      h('div', { class: 'opts row field-access' },
+        h('label', {}, '閲覧できる人 ', h('select', {
+          value: f.access, 'aria-label': `${f.label || '項目'} を閲覧できる人`,
+          onchange: e => { f.access = e.target.value; renderFields(); },
+        }, h('option', { value: 'all' }, 'アプリを見られる全員'), h('option', { value: 'restricted' }, '🔒 指定したユーザーだけ'))),
+        f.access === 'restricted' && directory.map(u => h('label', { class: 'pick' },
+          h('input', {
+            type: 'checkbox', checked: f.user_ids.includes(u.id),
+            onchange: e => { f.user_ids = e.target.checked ? [...f.user_ids, u.id] : f.user_ids.filter(id => id !== u.id); },
+          }), ` ${u.display_name}`))),
       f.type === 'lookup' && h('div', { class: 'opts row' },
         h('label', {}, '参照先アプリ ', h('select', {
           value: String(f.config.app_id ?? ''), disabled: !!f.id,
@@ -934,7 +946,7 @@ async function viewSettings(app, root) {
   renderFields();
 
   // アクセス権: 全ユーザー向けの既定と、ユーザーごとの個別指定
-  const [access, directory] = await Promise.all([api('GET', `/api/apps/${app.id}/access`), api('GET', '/api/users/directory')]);
+  const access = await api('GET', `/api/apps/${app.id}/access`);
   const members = access.members.map(m => ({ ...m }));
   const defaultRole = h('select', { value: access.default_role },
     h('option', { value: 'none' }, 'アクセス不可'), h('option', { value: 'viewer' }, '閲覧のみ'), h('option', { value: 'editor' }, '編集可'));
@@ -963,10 +975,10 @@ async function viewSettings(app, root) {
   fill(root, 
     h('div', { class: 'panel' },
       h('h2', {}, '項目の設定'),
-      h('div', { class: 'muted' }, 'レコードに入力する項目を定義します。項目を削除すると、その項目に入力済みの値も削除されます。'),
+      h('div', { class: 'muted' }, 'レコードに入力する項目を定義します。項目を削除すると、その項目に入力済みの値も削除されます。「閲覧できる人」を制限した項目は、指定した人とこのアプリの管理者だけが閲覧・編集できます。'),
       list,
       h('div', { class: 'row', style: 'margin-top:12px' },
-        h('button', { onclick: () => { draft.push({ label: '', type: 'text', required: false, optionsText: '', config: {} }); renderFields(); list.lastChild.querySelector('input').focus(); } }, '＋ 項目を追加'),
+        h('button', { onclick: () => { draft.push({ label: '', type: 'text', required: false, optionsText: '', config: {}, access: 'all', user_ids: [] }); renderFields(); list.lastChild.querySelector('input').focus(); } }, '＋ 項目を追加'),
         h('span', { class: 'spacer' }),
         h('button', {
           class: 'primary',
@@ -975,7 +987,7 @@ async function viewSettings(app, root) {
             if (removed.length && !confirm(`項目「${removed.map(f => f.label).join('、')}」と入力済みの値を削除します。よろしいですか？`)) return;
             try {
               await api('PUT', `/api/apps/${app.id}/fields`, {
-                fields: draft.map(f => ({ id: f.id ?? null, label: f.label, type: f.type, required: f.required, options: f.optionsText.split('\n'), config: f.config })),
+                fields: draft.map(f => ({ id: f.id ?? null, label: f.label, type: f.type, required: f.required, options: f.optionsText.split('\n'), config: f.config, access: f.access, user_ids: f.user_ids })),
               });
               toast('項目を保存しました'); route();
             } catch (err) { toast(err.message); }
