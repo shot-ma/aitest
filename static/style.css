@@ -169,3 +169,24 @@ dialog form { display: flex; flex-direction: column; max-height: calc(100vh - 42
   max-width: calc(100vw - 32px);
 }
 #toast.show { opacity: 1; }
+
+/* 表示名・通知 */
+.topbar { display: flex; align-items: center; gap: 8px; }
+#bell { position: relative; }
+#badge {
+  position: absolute; top: -6px; right: -6px;
+  background: var(--danger); color: #fff;
+  border-radius: 999px; font-size: .7rem; line-height: 1; padding: 3px 5px;
+}
+.notif { display: block; padding: 10px 12px; border-radius: 6px; color: var(--ink); text-decoration: none; border-left: 3px solid transparent; }
+.notif + .notif { border-top: 1px solid var(--line); }
+.notif:hover { background: var(--accent-soft); }
+.notif.unread { border-left-color: var(--accent); font-weight: 600; }
+
+/* コメント・添付・参照 */
+.comments { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+.comment { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.comment-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.comments textarea { margin: 10px 0 8px; }
+a.file { display: inline-block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; margin-right: 8px; }
+.lookup-results { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; max-height: 140px; overflow-y: auto; }

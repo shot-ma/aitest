@@ -21,8 +21,13 @@ function fill(el, ...kids) {
   el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false));
 }
 
+// 表示名（コメントの投稿者・通知の宛先に使う。認証ではない）はブラウザに保存する。
+let USER = '';
+try { USER = localStorage.getItem('userName') || ''; } catch { /* 保存できない環境でも動かす */ }
+const userName = () => USER || 'ゲスト';
+
 async function api(method, url, body) {
-  const opt = { method, headers: {} };
+  const opt = { method, headers: { 'X-User-Name': encodeURIComponent(USER) } };
   if (body instanceof FormData) opt.body = body;
   else if (body !== undefined) {
     opt.headers['Content-Type'] = 'application/json';
@@ -64,7 +69,7 @@ function openDialog({ title, body, submitLabel = '保存', onSubmit, extra = [] 
       h('div', { class: 'dlg-body' }, body),
       h('div', { class: 'dlg-foot' },
         extra, h('span', { class: 'spacer' }),
-        h('button', { type: 'button', onclick: () => dlg.close() }, 'キャンセル'),
+        h('button', { type: 'button', onclick: () => dlg.close() }, onSubmit ? 'キャンセル' : '閉じる'),
         onSubmit && h('button', { class: 'primary', type: 'submit' }, submitLabel))));
   dlg.addEventListener('close', () => dlg.remove());
   document.body.append(dlg);
@@ -82,22 +87,88 @@ const listState = {};
 
 async function route() {
   if (!META) META = await api('GET', '/api/meta');
-  const m = location.hash.match(/^#\/app\/(\d+)(?:\/(\w+))?/);
+  // 画面を切り替えるときは開いているダイアログを閉じる
+  document.querySelectorAll('dialog').forEach(d => d.close());
+  const m = location.hash.match(/^#\/app\/(\d+)(?:\/(\w+))?(?:\/(\d+))?/);
   try {
     if (!m) return await viewHome();
     const app = await api('GET', `/api/apps/${m[1]}`);
-    const tab = m[2] || 'records';
+    const tab = m[2] === 'record' ? 'records' : m[2] || 'records';
     const content = h('div');
     fill(main, appHeader(app, tab), content);
-    if (tab === 'settings') viewSettings(app, content);
+    if (tab === 'settings') await viewSettings(app, content);
     else if (tab === 'summary') viewSummary(app, content);
-    else await viewRecords(app, content);
+    else {
+      await viewRecords(app, content);
+      // #/app/1/record/5 の形式（通知や参照項目のリンク）ならそのレコードを開く
+      if (m[2] === 'record' && m[3]) {
+        const rec = await api('GET', `/api/apps/${app.id}/records/${m[3]}`);
+        const hash = location.hash;
+        // 閉じたら通常の一覧 URL に戻す（同じリンクをもう一度押しても開けるように）
+        recordDialog(app, rec, () => viewRecords(app, content)).addEventListener('close', () => {
+          if (location.hash === hash) history.replaceState(null, '', `#/app/${app.id}`);
+        });
+      }
+    }
   } catch (err) {
     fill(main, h('div', { class: 'empty' }, err.message, h('p', {}, h('a', { href: '#/' }, 'アプリ一覧へ戻る'))));
   }
 }
 window.addEventListener('hashchange', route);
-route();
+route().then(() => { if (!USER) userDialog(); });
+
+// ---------- 表示名と通知 ----------
+
+const userBtn = document.getElementById('userBtn');
+const badge = document.getElementById('badge');
+function showUser() { userBtn.textContent = '👤 ' + userName(); }
+showUser();
+userBtn.addEventListener('click', userDialog);
+
+function userDialog() {
+  const input = h('input', { class: 'wide', value: USER, maxLength: 50, required: true, placeholder: '例: 山田' });
+  openDialog({
+    title: '表示名の設定',
+    body: [
+      h('div', { class: 'form-field' }, h('label', {}, '表示名'), input),
+      h('div', { class: 'muted' }, 'コメントの投稿者名と通知の宛先に使います。このブラウザに保存されます。'),
+    ],
+    onSubmit: async () => {
+      USER = input.value.trim();
+      try { localStorage.setItem('userName', USER); } catch { /* 保存できなくても続行 */ }
+      showUser(); pollNotifications(); route();
+    },
+  });
+}
+
+async function pollNotifications() {
+  try {
+    const r = await api('GET', '/api/notifications');
+    badge.textContent = r.unread > 99 ? '99+' : r.unread;
+    badge.hidden = !r.unread;
+    return r;
+  } catch { return null; }
+}
+pollNotifications();
+setInterval(pollNotifications, 30000);
+
+document.getElementById('bell').addEventListener('click', async () => {
+  const r = await pollNotifications();
+  if (!r) return toast('通知を取得できませんでした');
+  const dlg = openDialog({
+    title: `通知（${userName()} さん宛て）`,
+    body: r.items.length
+      ? r.items.map(n => h('a', {
+          class: 'notif' + (n.read ? '' : ' unread'),
+          href: `#/app/${n.app_id}` + (n.record_id ? `/record/${n.record_id}` : ''),
+          onclick: () => dlg.close(),
+        },
+          h('div', {}, n.message),
+          h('div', { class: 'muted' }, `${n.app_icon} ${n.app_name}　${n.created_at}`)))
+      : h('div', { class: 'muted' }, '通知はありません。アプリ画面の「通知を受け取る」を押すと、そのアプリの更新が届きます。'),
+  });
+  if (r.unread) { await api('POST', '/api/notifications/read'); pollNotifications(); }
+});
 
 function appHeader(app, tab) {
   const link = (key, label) => h('a', {
@@ -107,7 +178,15 @@ function appHeader(app, tab) {
   return h('div', {},
     h('div', { class: 'row' },
       h('span', { style: 'font-size:1.8rem' }, app.icon),
-      h('div', {}, h('h1', {}, app.name), h('div', { class: 'muted' }, app.description))),
+      h('div', {}, h('h1', {}, app.name), h('div', { class: 'muted' }, app.description)),
+      h('span', { class: 'spacer' }),
+      h('button', {
+        title: 'このアプリのレコード登録・更新・コメントを通知で受け取ります',
+        onclick: async () => {
+          await api('PUT', `/api/apps/${app.id}/follow`, { follow: !app.following });
+          toast(app.following ? '通知を停止しました' : '通知を受け取ります'); route();
+        },
+      }, app.following ? '🔔 通知を受け取り中' : '🔕 通知を受け取る')),
     h('nav', { class: 'tabs' }, link('records', 'レコード一覧'), link('summary', '集計'), link('settings', '設定')));
 }
 
@@ -168,14 +247,27 @@ function buildQuery(app, st) {
   return p;
 }
 
-function cellContent(f, v) {
+const stop = e => e.stopPropagation();
+function fileLink(x) {
+  const kb = Math.max(1, Math.round(x.size / 1024)).toLocaleString('ja-JP');
+  return h('a', { class: 'file', href: `/api/files/${x.id}`, title: `${x.name}（${kb} KB）`, onclick: stop }, '📎 ' + x.name);
+}
+
+function cellContent(f, v, refs) {
   if (v == null || v === '') return '';
+  if (f.type === 'file') return v.map(fileLink);
+  if (f.type === 'lookup') {
+    const ref = refs[f.id];
+    return ref && ref.label != null
+      ? h('a', { href: `#/app/${ref.app_id}/record/${ref.id}`, onclick: stop }, ref.label)
+      : h('span', { class: 'muted' }, '（削除済み）');
+  }
   if (f.type === 'multi') return v.map(x => h('span', { class: 'chip' }, x));
   if (f.type === 'select' || f.type === 'radio') return h('span', { class: 'chip' }, v);
   if (f.type === 'check') return v ? '✓' : '';
   if (f.type === 'number') return Number(v).toLocaleString('ja-JP');
   if (f.type === 'url' && /^https?:\/\//.test(v)) {
-    return h('a', { href: v, target: '_blank', rel: 'noopener noreferrer', onclick: e => e.stopPropagation() }, v);
+    return h('a', { href: v, target: '_blank', rel: 'noopener noreferrer', onclick: stop }, v);
   }
   return String(v);
 }
@@ -242,12 +334,14 @@ async function viewRecords(app, root) {
       h('button', { class: 'primary', onclick: () => recordDialog(app, null, reload) }, '＋ レコード追加')),
     res.records.length
       ? h('div', { class: 'table-wrap' }, h('table', {},
-          h('thead', {}, h('tr', {}, th('id', 'No.'), app.fields.map(f => th(f.id, f.label)), th('updated_at', '更新日時'))),
+          h('thead', {}, h('tr', {}, th('id', 'No.'), app.fields.map(f => th(f.id, f.label)),
+            h('th', { 'aria-label': 'コメント数', style: 'cursor:default' }, '💬'), th('updated_at', '更新日時'))),
           h('tbody', {}, res.records.map(r =>
             h('tr', { tabIndex: 0, onclick: () => recordDialog(app, r, reload),
                       onkeydown: e => { if (e.key === 'Enter') recordDialog(app, r, reload); } },
               h('td', { class: 'num' }, r.id),
-              app.fields.map(f => h('td', { class: f.type === 'number' ? 'num' : '' }, cellContent(f, r.data[f.id]))),
+              app.fields.map(f => h('td', { class: f.type === 'number' ? 'num' : '' }, cellContent(f, r.data[f.id], r.refs))),
+              h('td', { class: 'muted' }, r.comment_count || ''),
               h('td', { class: 'muted' }, r.updated_at))))))
       : h('div', { class: 'panel empty' }, 'レコードがありません。'),
     h('div', { class: 'row', style: 'margin-top:12px' },
@@ -258,9 +352,58 @@ async function viewRecords(app, root) {
 }
 
 // 項目の型に応じた入力欄を作り、値を取り出す関数と一緒に返す。
-function fieldInput(f, value) {
+function fieldInput(f, value, ref) {
   const name = 'f' + f.id;
   switch (f.type) {
+    case 'file': {
+      // 選んだ時点でアップロードし、レコード保存時に ID の一覧を送る
+      let files = [...(value || [])];
+      const listEl = h('div');
+      const draw = () => fill(listEl, files.map(x => h('div', { class: 'row' }, fileLink(x),
+        h('button', { type: 'button', class: 'icon danger', title: '添付を外す', onclick: () => { files = files.filter(y => y !== x); draw(); } }, '✕'))));
+      const input = h('input', {
+        type: 'file', multiple: true, 'aria-label': f.label,
+        onchange: async () => {
+          for (const file of input.files) {
+            if (file.size > META.max_file_size) { toast(`${file.name}: ファイルが大きすぎます（上限 ${META.max_file_size / 1048576}MB）`); continue; }
+            const fd = new FormData();
+            fd.append('file', file);
+            try { files.push(await api('POST', `/api/apps/${f.app_id}/fields/${f.id}/files`, fd)); draw(); }
+            catch (err) { toast(`${file.name}: ${err.message}`); }
+          }
+          input.value = '';
+        },
+      });
+      draw();
+      return [h('div', {}, listEl, input), () => files.map(x => x.id)];
+    }
+    case 'lookup': {
+      // 参照先アプリのレコードを検索して1件選ぶ
+      let cur = ref ? { id: ref.id, label: ref.label ?? '（削除済み）' } : null;
+      let timer;
+      const box = h('div'), results = h('div', { class: 'lookup-results' });
+      const search = h('input', {
+        type: 'search', class: 'wide', placeholder: '参照先のレコードを検索', 'aria-label': f.label + 'を検索',
+        oninput: () => { clearTimeout(timer); timer = setTimeout(find, 250); },
+        onkeydown: e => { if (e.key === 'Enter') e.preventDefault(); },
+      });
+      async function find() {
+        try {
+          const rows = await api('GET', `/api/apps/${f.app_id}/fields/${f.id}/candidates?q=${encodeURIComponent(search.value)}`);
+          fill(results, rows.length
+            ? rows.map(r => h('button', { type: 'button', onclick: () => { cur = r; draw(); } }, r.label))
+            : h('span', { class: 'muted' }, '該当するレコードがありません'));
+        } catch (err) { fill(results, h('span', { class: 'muted' }, err.message)); }
+      }
+      function draw() {
+        if (cur) {
+          fill(box, h('div', { class: 'row' }, h('span', { class: 'chip' }, cur.label),
+            h('button', { type: 'button', class: 'icon', title: '選択を解除', onclick: () => { cur = null; draw(); } }, '✕')));
+        } else { fill(box, search, results); find(); }
+      }
+      draw();
+      return [box, () => (cur ? cur.id : null)];
+    }
     case 'textarea': { const el = h('textarea', { value: value ?? '' }); return [el, () => el.value]; }
     case 'select': {
       const el = h('select', { value: value ?? '' }, h('option', { value: '' }, '（未選択）'), f.options.map(o => h('option', { value: o }, o)));
@@ -291,7 +434,7 @@ function fieldInput(f, value) {
 function recordDialog(app, record, onDone) {
   const getters = {}, errorEls = {};
   const body = app.fields.map(f => {
-    const [el, get] = fieldInput(f, record?.data[f.id]);
+    const [el, get] = fieldInput(f, record?.data[f.id], record?.refs[f.id]);
     getters[f.id] = get;
     errorEls[f.id] = h('div', { class: 'error' });
     return h('div', { class: 'form-field' },
@@ -299,7 +442,9 @@ function recordDialog(app, record, onDone) {
   });
   const dlg = openDialog({
     title: record ? `レコード No.${record.id} を編集` : 'レコードを追加',
-    body: [body, record && h('div', { class: 'muted' }, `作成: ${record.created_at}　更新: ${record.updated_at}`)],
+    body: [body,
+      record && h('div', { class: 'muted' }, `作成: ${record.created_at} ${record.created_by}　更新: ${record.updated_at} ${record.updated_by}`),
+      record && commentsSection(app, record, onDone)],
     extra: record ? [h('button', {
       type: 'button', class: 'danger',
       onclick: async () => {
@@ -321,12 +466,45 @@ function recordDialog(app, record, onDone) {
       toast('保存しました'); onDone();
     },
   });
+  return dlg;
+}
+
+function commentsSection(app, record, onChange) {
+  const url = `/api/apps/${app.id}/records/${record.id}/comments`;
+  const listEl = h('div');
+  const input = h('textarea', { placeholder: 'コメントを入力', 'aria-label': 'コメント', maxLength: 2000, style: 'min-height:60px' });
+  async function load() {
+    const items = await api('GET', url);
+    fill(listEl, items.length ? items.map(c => h('div', { class: 'comment' },
+      h('div', { class: 'row muted' }, h('b', {}, c.author), c.created_at, h('span', { class: 'spacer' }),
+        c.author === userName() && h('button', {
+          type: 'button', class: 'icon danger', title: 'コメントを削除',
+          onclick: async () => {
+            if (!confirm('このコメントを削除しますか？')) return;
+            await api('DELETE', `${url}/${c.id}`); await load(); onChange();
+          },
+        }, '✕')),
+      h('div', { class: 'comment-body' }, c.body)))
+      : h('div', { class: 'muted' }, 'コメントはまだありません。'));
+  }
+  load().catch(err => toast(err.message));
+  return h('div', { class: 'comments' },
+    h('h2', {}, 'コメント'), listEl, input,
+    h('div', { class: 'row' }, h('span', { class: 'muted' }, `${userName()} として投稿`), h('span', { class: 'spacer' }),
+      h('button', {
+        type: 'button',
+        onclick: async () => {
+          if (!input.value.trim()) return;
+          try { await api('POST', url, { body: input.value }); input.value = ''; await load(); onChange(); }
+          catch (err) { toast(err.message); }
+        },
+      }, 'コメントする')));
 }
 
 // ---------- 集計 ----------
 
 function viewSummary(app, root) {
-  const groupable = app.fields.filter(f => !['textarea', 'url', 'number'].includes(f.type));
+  const groupable = app.fields.filter(f => !['textarea', 'url', 'number', 'file'].includes(f.type));
   const numeric = app.fields.filter(f => f.type === 'number');
   if (!groupable.length) {
     fill(root, h('div', { class: 'panel empty' }, '集計に使える項目（メニュー・日付など）がありません。'));
@@ -358,11 +536,22 @@ function viewSummary(app, root) {
 
 // ---------- 設定 ----------
 
-function viewSettings(app, root) {
+async function viewSettings(app, root) {
+  // 参照項目の設定用に、アプリ一覧と参照先アプリの項目を用意する
+  const apps = await api('GET', '/api/apps');
+  const targetFields = {};
+  async function loadTarget(id) {
+    if (id && !targetFields[id]) {
+      const t = await api('GET', `/api/apps/${id}`).catch(() => ({ fields: [] }));
+      targetFields[id] = t.fields.filter(x => META.lookup_display_types.includes(x.type));
+    }
+  }
+  await Promise.all(app.fields.filter(f => f.type === 'lookup').map(f => loadTarget(f.config.app_id)));
+
   const name = h('input', { class: 'wide', value: app.name, required: true, maxLength: 100 });
   const desc = h('input', { class: 'wide', value: app.description, maxLength: 500 });
   const icon = h('input', { value: app.icon, maxLength: 8, size: 4 });
-  const draft = app.fields.map(f => ({ ...f, optionsText: f.options.join('\n') }));
+  const draft = app.fields.map(f => ({ ...f, config: { ...f.config }, optionsText: f.options.join('\n') }));
   const list = h('div');
 
   function renderFields() {
@@ -379,7 +568,19 @@ function viewSettings(app, root) {
         h('button', { class: 'icon', title: '下へ', disabled: i === draft.length - 1, onclick: () => move(i, 1) }, '↓'),
         h('button', { class: 'icon danger', title: '項目を削除', onclick: () => { draft.splice(i, 1); renderFields(); } }, '✕')),
       CHOICE.includes(f.type) && h('div', { class: 'opts' },
-        h('textarea', { value: f.optionsText, placeholder: '選択肢を1行に1つずつ入力', 'aria-label': '選択肢', oninput: e => { f.optionsText = e.target.value; } }))))
+        h('textarea', { value: f.optionsText, placeholder: '選択肢を1行に1つずつ入力', 'aria-label': '選択肢', oninput: e => { f.optionsText = e.target.value; } })),
+      f.type === 'lookup' && h('div', { class: 'opts row' },
+        h('label', {}, '参照先アプリ ', h('select', {
+          value: String(f.config.app_id ?? ''), disabled: !!f.id,
+          title: f.id ? '保存済みの項目は参照先アプリを変更できません' : '',
+          onchange: async e => { f.config = { app_id: Number(e.target.value) || null }; await loadTarget(f.config.app_id); renderFields(); },
+        }, h('option', { value: '' }, '（選択してください）'),
+          apps.map(a => h('option', { value: String(a.id) }, `${a.icon} ${a.name}`)))),
+        h('label', {}, '表示する項目 ', h('select', {
+          value: String(f.config.field_id ?? ''),
+          onchange: e => { f.config.field_id = Number(e.target.value) || null; },
+        }, h('option', { value: '' }, '（選択してください）'),
+          (targetFields[f.config.app_id] || []).map(x => h('option', { value: String(x.id) }, x.label)))))))
       : h('div', { class: 'muted', style: 'padding:12px 0' }, '項目がありません。「＋ 項目を追加」で追加してください。'));
   }
   function move(i, d) { [draft[i], draft[i + d]] = [draft[i + d], draft[i]]; renderFields(); }
@@ -391,7 +592,7 @@ function viewSettings(app, root) {
       h('div', { class: 'muted' }, 'レコードに入力する項目を定義します。項目を削除すると、その項目に入力済みの値も削除されます。'),
       list,
       h('div', { class: 'row', style: 'margin-top:12px' },
-        h('button', { onclick: () => { draft.push({ label: '', type: 'text', required: false, optionsText: '' }); renderFields(); list.lastChild.querySelector('input').focus(); } }, '＋ 項目を追加'),
+        h('button', { onclick: () => { draft.push({ label: '', type: 'text', required: false, optionsText: '', config: {} }); renderFields(); list.lastChild.querySelector('input').focus(); } }, '＋ 項目を追加'),
         h('span', { class: 'spacer' }),
         h('button', {
           class: 'primary',
@@ -400,7 +601,7 @@ function viewSettings(app, root) {
             if (removed.length && !confirm(`項目「${removed.map(f => f.label).join('、')}」と入力済みの値を削除します。よろしいですか？`)) return;
             try {
               await api('PUT', `/api/apps/${app.id}/fields`, {
-                fields: draft.map(f => ({ id: f.id ?? null, label: f.label, type: f.type, required: f.required, options: f.optionsText.split('\n') })),
+                fields: draft.map(f => ({ id: f.id ?? null, label: f.label, type: f.type, required: f.required, options: f.optionsText.split('\n'), config: f.config })),
               });
               toast('項目を保存しました'); route();
             } catch (err) { toast(err.message); }
