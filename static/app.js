@@ -97,22 +97,31 @@ async function route() {
     if (location.hash === '#/users' && ME.role === 'admin') return await viewUsers();
     if (!m) return await viewHome();
     const app = await api('GET', `/api/apps/${m[1]}`);
-    let tab = m[2] === 'record' ? 'records' : m[2] || 'records';
+    let tab = ['settings', 'summary'].includes(m[2]) ? m[2] : 'records';
     if (tab === 'settings' && app.role !== 'manager') tab = 'records';
     const content = h('div');
     fill(main, appHeader(app, tab), content);
     if (tab === 'settings') await viewSettings(app, content);
     else if (tab === 'summary') viewSummary(app, content);
-    else if (tab === 'calendar') await viewCalendar(app, content);
     else {
-      await viewRecords(app, content);
+      // 表示するビューを決める。URL に指定がなければ先頭のビュー（全員共通の既定）を使う
+      let view = null, mode = null;
+      if (m[2] === 'view') view = app.views.find(v => v.id === Number(m[3])) || null;
+      else if (m[2] === 'calendar') mode = 'calendar';
+      else if (m[2] === 'list' || m[2] === 'record') mode = 'list';
+      if (!view && !mode) view = app.views[0] || null;
+      mode = view ? (view.type === 'calendar' ? 'calendar' : 'list') : mode || 'list';
+      const body = h('div');
+      fill(content, viewBar(app, view, mode), body);
+      const render = () => (mode === 'calendar' ? viewCalendar(app, body, view) : viewRecords(app, body, view));
+      await render();
       // #/app/1/record/5 の形式（通知や参照項目のリンク）ならそのレコードを開く
       if (m[2] === 'record' && m[3]) {
         const rec = await api('GET', `/api/apps/${app.id}/records/${m[3]}`);
         const hash = location.hash;
-        // 閉じたら通常の一覧 URL に戻す（同じリンクをもう一度押しても開けるように）
-        recordDialog(app, rec, () => viewRecords(app, content)).addEventListener('close', () => {
-          if (location.hash === hash) history.replaceState(null, '', `#/app/${app.id}`);
+        // 閉じたら通常の URL に戻す（同じリンクをもう一度押しても開けるように）
+        recordDialog(app, rec, render).addEventListener('close', () => {
+          if (location.hash === hash) history.replaceState(null, '', `#/app/${app.id}/list`);
         });
       }
     }
@@ -307,8 +316,7 @@ function appHeader(app, tab) {
           toast(app.following ? '通知を停止しました' : '通知を受け取ります'); route();
         },
       }, app.following ? '🔔 通知を受け取り中' : '🔕 通知を受け取る')),
-    h('nav', { class: 'tabs' }, link('records', 'レコード一覧'),
-      app.fields.some(f => f.type === 'date') && link('calendar', 'カレンダー'), link('summary', '集計'), app.role === 'manager' && link('settings', '設定')));
+    h('nav', { class: 'tabs' }, link('records', 'レコード'), link('summary', '集計'), app.role === 'manager' && link('settings', '設定')));
 }
 
 // ---------- アプリ一覧 ----------
@@ -359,6 +367,114 @@ function newAppDialog() {
   });
 }
 
+// ---------- ビュー（一覧・カレンダーの表示設定に名前を付けたもの） ----------
+
+const go = hash => { if (location.hash === hash) route(); else location.hash = hash; };
+
+// ビューの切り替え欄。アプリの管理者には追加・編集ボタンも出す
+function viewBar(app, view, mode) {
+  const manager = app.role === 'manager';
+  const current = view ? `view/${view.id}` : mode;
+  return h('div', { class: 'row viewbar' },
+    h('label', {}, 'ビュー ', h('select', {
+      value: current, onchange: e => { location.hash = `#/app/${app.id}/${e.target.value}`; },
+    },
+      app.views.map((v, i) => h('option', { value: `view/${v.id}` }, `${v.type === 'calendar' ? '📅' : '📋'} ${v.name}${i === 0 ? '（既定）' : ''}`)),
+      h('option', { value: 'list' }, '📋 すべての項目（標準）'),
+      app.fields.some(f => f.type === 'date') && h('option', { value: 'calendar' }, '📅 カレンダー（標準）'))),
+    manager && view && h('span', { class: 'chip' }, view.access === 'restricted' ? `🔒 ${view.user_ids.length} 人に公開` : '全員に公開'),
+    h('span', { class: 'spacer' }),
+    manager && view && h('button', { onclick: () => viewDialog(app, view) }, 'このビューを編集'),
+    manager && h('button', { onclick: () => viewDialog(app, null, mode) }, '＋ ビューを追加'));
+}
+
+async function viewDialog(app, view, mode) {
+  const directory = await api('GET', '/api/users/directory');
+  const cfg = view ? view.config : {};
+  const dateFields = app.fields.filter(f => f.type === 'date');
+  const check = (label, checked) => { const box = h('input', { type: 'checkbox', checked }); return [box, h('label', {}, box, ' ' + label)]; };
+  const fieldOptions = list => list.map(f => h('option', { value: String(f.id) }, f.label));
+
+  const name = h('input', { class: 'wide', required: true, maxLength: 50, value: view ? view.name : '', placeholder: '例: 未対応の一覧' });
+  const type = h('select', { value: view ? view.type : mode === 'calendar' && dateFields.length ? 'calendar' : 'table', disabled: !!view, onchange: sync },
+    h('option', { value: 'table' }, '📋 一覧（表形式）'), dateFields.length > 0 && h('option', { value: 'calendar' }, '📅 カレンダー'));
+  // 一覧用: 表示する項目と並び順
+  const columns = app.fields.map(f => [f, ...check(f.label, view && view.type === 'table' ? cfg.columns.includes(f.id) : true)]);
+  const sort = h('select', { value: cfg.sort || 'id' },
+    h('option', { value: 'id' }, 'No.'), h('option', { value: 'updated_at' }, '更新日時'), h('option', { value: 'created_at' }, '作成日時'),
+    fieldOptions(app.fields.filter(f => f.type !== 'file')));
+  const order = h('select', { value: cfg.order || 'desc' }, h('option', { value: 'asc' }, '昇順'), h('option', { value: 'desc' }, '降順'));
+  // カレンダー用: 基準の日付項目と表示項目
+  const titleFields = app.fields.filter(f => f.type !== 'file');
+  const dateField = h('select', { value: String(cfg.date_field ?? dateFields[0]?.id ?? '') }, fieldOptions(dateFields));
+  const titleField = h('select', { value: String(cfg.title_field ?? (app.fields.find(f => f.type === 'text') || titleFields[0])?.id ?? '') }, fieldOptions(titleFields));
+  // 共通: 絞り込み条件
+  const filters = app.fields.filter(f => [...CHOICE, 'check'].includes(f.type)).map(f => {
+    const opts = f.type === 'check' ? [['1', 'オン'], ['0', 'オフ']] : f.options.map(o => [o, o]);
+    return [f, h('select', { value: (cfg.filters || {})[f.id] ?? '', 'aria-label': f.label + 'の絞り込み' },
+      h('option', { value: '' }, `${f.label}: 指定なし`), opts.map(([v, l]) => h('option', { value: v }, `${f.label}: ${l}`)))];
+  });
+  // 公開範囲
+  const access = h('select', { value: view ? view.access : 'all', onchange: sync },
+    h('option', { value: 'all' }, 'このアプリを見られる全員'), h('option', { value: 'restricted' }, '指定したユーザーだけ'));
+  const users = directory.map(u => [u, ...check(`${u.display_name}（${u.username}）`, !!view && view.user_ids.includes(u.id))]);
+  const [makeDefault, makeDefaultLabel] = check('既定のビューにする（一覧の先頭に移動し、全員が最初に見るビューになります）', !!view && app.views[0].id === view.id);
+
+  const tableBox = h('div', {},
+    h('div', { class: 'form-field' }, h('div', { class: 'label' }, '表示する項目'), h('div', { class: 'choices' }, columns.map(c => c[2]))),
+    h('div', { class: 'form-field' }, h('div', { class: 'label' }, '並び順'), h('div', { class: 'row' }, sort, order)));
+  const calBox = h('div', {},
+    h('div', { class: 'form-field' }, h('label', {}, '基準にする日付項目'), dateField),
+    h('div', { class: 'form-field' }, h('label', {}, 'カレンダーに表示する項目'), titleField));
+  const usersBox = h('div', { class: 'form-field' },
+    h('div', { class: 'choices' }, users.map(u => u[2])),
+    h('div', { class: 'muted' }, 'アプリの管理権限を持つ人は、指定しなくてもすべてのビューを使えます。'));
+  function sync() {
+    tableBox.hidden = type.value !== 'table';
+    calBox.hidden = type.value !== 'calendar';
+    usersBox.hidden = access.value !== 'restricted';
+  }
+  sync();
+
+  const clearState = () => { for (const s of [listState, calState]) for (const k of Object.keys(s)) delete s[k]; };
+  const dlg = openDialog({
+    title: view ? `ビュー「${view.name}」を編集` : 'ビューを追加',
+    body: [
+      h('div', { class: 'form-field' }, h('label', {}, 'ビュー名'), name),
+      h('div', { class: 'form-field' }, h('label', {}, '種類'), type),
+      tableBox, calBox,
+      filters.length > 0 && h('div', { class: 'form-field' }, h('div', { class: 'label' }, '絞り込み条件'), h('div', { class: 'row' }, filters.map(f => f[1]))),
+      h('div', { class: 'form-field' }, h('label', {}, 'このビューを使える人'), access),
+      usersBox,
+      h('div', { class: 'form-field' }, makeDefaultLabel),
+    ],
+    extra: view ? [h('button', {
+      type: 'button', class: 'danger',
+      onclick: async () => {
+        if (!confirm(`ビュー「${view.name}」を削除しますか？（レコードは削除されません）`)) return;
+        await api('DELETE', `/api/apps/${app.id}/views/${view.id}`);
+        dlg.close(); clearState(); toast('ビューを削除しました'); go(`#/app/${app.id}`);
+      },
+    }, '削除')] : [],
+    onSubmit: async () => {
+      const filterValues = Object.fromEntries(filters.filter(f => f[1].value !== '').map(f => [f[0].id, f[1].value]));
+      const body = {
+        name: name.value, type: type.value, access: access.value,
+        user_ids: users.filter(u => u[1].checked).map(u => u[0].id),
+        // 既定のチェックは「先頭へ移動」の指示。すでに先頭なら送らない
+        make_default: makeDefault.checked && !(view && app.views[0].id === view.id),
+        config: type.value === 'calendar'
+          ? { date_field: Number(dateField.value), title_field: Number(titleField.value), filters: filterValues }
+          : { columns: columns.filter(c => c[1].checked).map(c => c[0].id), sort: sort.value, order: order.value, filters: filterValues },
+      };
+      const saved = view
+        ? await api('PUT', `/api/apps/${app.id}/views/${view.id}`, body)
+        : await api('POST', `/api/apps/${app.id}/views`, body);
+      clearState(); toast('ビューを保存しました'); go(`#/app/${app.id}/view/${saved.id}`);
+    },
+  });
+}
+
 // ---------- レコード一覧 ----------
 
 function buildQuery(app, st) {
@@ -393,9 +509,14 @@ function cellContent(f, v, refs) {
   return String(v);
 }
 
-async function viewRecords(app, root) {
-  const st = listState[app.id] ||= { q: '', sort: 'id', order: 'desc', page: 1, filters: {} };
-  const reload = () => viewRecords(app, root);
+async function viewRecords(app, root, view) {
+  // ビューの並び順・絞り込みを初期値にする（画面上での変更は一時的なもの）
+  const cfg = view ? view.config : null;
+  const st = listState[`${app.id}:${view ? view.id : 0}`] ||= {
+    q: '', page: 1, sort: cfg ? cfg.sort : 'id', order: cfg ? cfg.order : 'desc', filters: cfg ? { ...cfg.filters } : {},
+  };
+  const cols = cfg && cfg.columns.length ? app.fields.filter(f => cfg.columns.includes(f.id)) : app.fields;
+  const reload = () => viewRecords(app, root, view);
   const canEdit = app.role !== 'viewer';
 
   if (!app.fields.length) {
@@ -456,13 +577,13 @@ async function viewRecords(app, root) {
       canEdit && h('button', { class: 'primary', onclick: () => recordDialog(app, null, reload) }, '＋ レコード追加')),
     res.records.length
       ? h('div', { class: 'table-wrap' }, h('table', {},
-          h('thead', {}, h('tr', {}, th('id', 'No.'), app.fields.map(f => th(f.id, f.label)),
+          h('thead', {}, h('tr', {}, th('id', 'No.'), cols.map(f => th(f.id, f.label)),
             h('th', { 'aria-label': 'コメント数', style: 'cursor:default' }, '💬'), th('updated_at', '更新日時'))),
           h('tbody', {}, res.records.map(r =>
             h('tr', { tabIndex: 0, onclick: () => recordDialog(app, r, reload),
                       onkeydown: e => { if (e.key === 'Enter') recordDialog(app, r, reload); } },
               h('td', { class: 'num' }, r.id),
-              app.fields.map(f => h('td', { class: f.type === 'number' ? 'num' : '' }, cellContent(f, r.data[f.id], r.refs))),
+              cols.map(f => h('td', { class: f.type === 'number' ? 'num' : '' }, cellContent(f, r.data[f.id], r.refs))),
               h('td', { class: 'muted' }, r.comment_count || ''),
               h('td', { class: 'muted' }, r.updated_at))))))
       : h('div', { class: 'panel empty' }, 'レコードがありません。'),
@@ -650,7 +771,7 @@ function plainText(f, r) {
 const pad = n => String(n).padStart(2, '0');
 const ymd = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
 
-async function viewCalendar(app, root) {
+async function viewCalendar(app, root, view) {
   const dateFields = app.fields.filter(f => f.type === 'date');
   if (!dateFields.length) {
     fill(root, h('div', { class: 'panel empty' }, 'カレンダー表示には日付項目が必要です。'));
@@ -658,18 +779,23 @@ async function viewCalendar(app, root) {
   }
   const now = new Date();
   const titleFields = app.fields.filter(f => f.type !== 'file');
-  const st = calState[app.id] ||= { ...calPrefs(app.id), year: now.getFullYear(), month: now.getMonth() };
+  const st = calState[`${app.id}:${view ? view.id : 0}`] ||= {
+    // 保存済みビューはその設定、標準カレンダーは前回ブラウザで選んだ項目から始める
+    ...(view ? { field: view.config.date_field, title: view.config.title_field } : calPrefs(app.id)),
+    year: now.getFullYear(), month: now.getMonth(),
+  };
   if (!dateFields.some(f => f.id === st.field)) st.field = dateFields[0].id;
   // 表示項目の既定は最初の1行文字列（無ければ先頭の項目）
   if (!titleFields.some(f => f.id === st.title)) st.title = (app.fields.find(f => f.type === 'text') || titleFields[0]).id;
-  const choose = (key, value) => { st[key] = value; calPrefs(app.id, { field: st.field, title: st.title }); reload(); };
-  const reload = () => viewCalendar(app, root);
+  const choose = (key, value) => { st[key] = value; if (!view) calPrefs(app.id, { field: st.field, title: st.title }); reload(); };
+  const reload = () => viewCalendar(app, root, view);
   const canEdit = app.role !== 'viewer';
   const titleField = titleFields.find(f => f.id === st.title);
   const title = r => plainText(titleField, r) || `No.${r.id}`; // 値が空のレコードは番号で表示
 
   const lastDay = new Date(st.year, st.month + 1, 0).getDate();
   const q = new URLSearchParams({ per_page: 500, sort: 'id', order: 'asc' });
+  if (view) for (const [id, v] of Object.entries(view.config.filters)) q.set('f_' + id, v);
   q.set(`f_${st.field}_from`, ymd(st.year, st.month, 1));
   q.set(`f_${st.field}_to`, ymd(st.year, st.month, lastDay));
   // 件数が多くても全件出すため、ページを最後まで読む

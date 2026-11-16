@@ -527,3 +527,53 @@ def test_date_range_filter(client, inquiry):
     assert get(**{f"{key}_from": "2026-12-01"}) == ["2026-12-01"]
     # ほかの絞り込みと組み合わせられる
     assert get(**{f"{key}_from": "2026-11-01", f"{key}_to": "2026-11-30", f"f_{ids['状況']}": "完了"}) == ["完了分"]
+
+
+def test_views(client, inquiry):
+    app_id, ids = inquiry
+    base = f"/api/apps/{app_id}"
+    sato, tanaka = new_user(client, "sato", "佐藤"), new_user(client, "tanaka", "田中")
+    n = lambda label: int(ids[label])
+    table = {"name": "未対応だけ", "type": "table", "config": {
+        "columns": [n("件名"), n("状況"), 9999, n("件名")], "sort": ids["受付日"], "order": "asc",
+        "filters": {ids["状況"]: "未対応", ids["件名"]: "x", "9999": "y"}}}
+    assert sato.post(f"{base}/views", json=table).status_code == 403  # 管理者だけが保存できる
+    v1 = client.post(f"{base}/views", json=table).json()["id"]
+    views = client.get(base).json()["views"]
+    assert views == [{"id": v1, "name": "未対応だけ", "type": "table", "access": "all", "user_ids": [],
+                      "config": {"columns": [n("件名"), n("状況")], "sort": ids["受付日"], "order": "asc",
+                                 "filters": {ids["状況"]: "未対応"}}}]
+
+    # 入力チェック
+    bad = lambda **kw: client.post(f"{base}/views", json={**table, **kw}).status_code
+    assert bad(name=" ") == 400
+    assert bad(type="chart") == 400
+    assert bad(config={"columns": []}) == 400
+    assert bad(type="calendar", config={"date_field": n("件名")}) == 400
+    assert bad(access="restricted", user_ids=[9999]) == 400
+    assert client.put(f"{base}/views/{v1}", json={**table, "type": "calendar",
+                                                  "config": {"date_field": n("受付日")}}).status_code == 400
+
+    # 限定公開のカレンダービューを既定（先頭）として追加
+    cal = {"name": "受付カレンダー", "type": "calendar", "access": "restricted", "user_ids": [sato.user_id],
+           "make_default": True, "config": {"date_field": n("受付日"), "title_field": n("状況")}}
+    v2 = client.post(f"{base}/views", json=cal).json()["id"]
+    assert [v["id"] for v in client.get(base).json()["views"]] == [v2, v1]
+    assert [v["id"] for v in sato.get(base).json()["views"]] == [v2, v1]
+    assert [v["id"] for v in tanaka.get(base).json()["views"]] == [v1]  # 指定されていない人には出ない
+    assert "user_ids" not in sato.get(base).json()["views"][0]  # 公開範囲は管理者にだけ返す
+
+    # 更新（公開範囲の変更）と、項目削除後の自動整理
+    client.put(f"{base}/views/{v2}", json={**cal, "access": "all", "make_default": False})
+    assert [v["id"] for v in tanaka.get(base).json()["views"]] == [v2, v1]
+    fields = [f for f in client.get(base).json()["fields"] if f["label"] not in ("状況", "受付日")]
+    client.put(f"{base}/fields", json={"fields": fields})
+    after = {v["id"]: v["config"] for v in client.get(base).json()["views"]}
+    assert after[v1] == {"columns": [n("件名")], "sort": "id", "order": "asc", "filters": {}}
+    assert after[v2] == {"date_field": None, "title_field": None, "filters": {}}
+
+    assert sato.delete(f"{base}/views/{v1}").status_code == 403
+    assert client.delete(f"{base}/views/{v1}").status_code == 204
+    assert client.delete(f"{base}/views/{v1}").status_code == 404
+    other = client.post("/api/apps", json={"name": "別"}).json()
+    assert client.delete(f"/api/apps/{other['id']}/views/{v2}").status_code == 404  # 別アプリ経由では消せない

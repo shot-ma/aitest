@@ -171,6 +171,21 @@ CREATE TABLE IF NOT EXISTS user_notifications (
     created_at TEXT NOT NULL,
     read INTEGER NOT NULL DEFAULT 0
 );
+-- ビュー: 一覧またはカレンダーの表示設定に名前を付けて保存したもの。position が先頭のものが既定
+CREATE TABLE IF NOT EXISTS views (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,                  -- table（一覧）/ calendar
+    config TEXT NOT NULL DEFAULT '{}',
+    access TEXT NOT NULL DEFAULT 'all',  -- all（アプリを見られる全員）/ restricted（指定ユーザーのみ）
+    position INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS view_members (
+    view_id INTEGER NOT NULL REFERENCES views(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (view_id, user_id)
+);
 -- ログイン導入前の、表示名ベースのフォローと通知は引き継げないので破棄する
 DROP TABLE IF EXISTS followers;
 DROP TABLE IF EXISTS notifications;
@@ -339,6 +354,15 @@ class PasswordIn(BaseModel):
     new: str
 
 
+class ViewIn(BaseModel):
+    name: str
+    type: str
+    config: dict = {}
+    access: str = "all"
+    user_ids: list[int] = []
+    make_default: bool = False  # True なら先頭に移動する（先頭のビューが全員の既定になる）
+
+
 class MemberIn(BaseModel):
     user_id: int
     role: str
@@ -387,7 +411,8 @@ def can_view(conn, app_id, user: dict) -> bool:
 def app_detail(conn, app_id: int, user: dict) -> dict:
     following = conn.execute("SELECT 1 FROM app_followers WHERE app_id = ? AND user_id = ?",
                              (app_id, user["id"])).fetchone()
-    return {**get_app(conn, app_id, user), "fields": get_fields(conn, app_id),
+    a, fields = get_app(conn, app_id, user), get_fields(conn, app_id)
+    return {**a, "fields": fields, "views": get_views(conn, a, user, fields),
             "following": bool(following)}
 
 
@@ -395,6 +420,95 @@ def get_fields(conn, app_id: int) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM fields WHERE app_id = ? ORDER BY position, id", (app_id,))
     return [field_row(r) for r in rows]
+
+
+def clean_view_config(vtype: str, config: dict, fields: list[dict], strict: bool) -> dict:
+    """ビューの設定を検証・正規化する。strict=False のときは、削除された項目などを黙って取り除く。"""
+    by_id = {f["id"]: f for f in fields}
+
+    def field_id(v):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None
+        return v if v in by_id else None
+
+    filters, raw = {}, config.get("filters")
+    for k, v in (raw.items() if isinstance(raw, dict) else []):
+        f = by_id.get(field_id(k))
+        if f and f["type"] in CHOICE_TYPES | {"check"} and isinstance(v, str) and v:
+            filters[str(f["id"])] = v
+    if vtype == "calendar":
+        d, t = field_id(config.get("date_field")), field_id(config.get("title_field"))
+        if d is None or by_id[d]["type"] != "date":
+            if strict:
+                raise HTTPException(400, "カレンダーの基準にする日付項目を選択してください")
+            d = None
+        if t is not None and by_id[t]["type"] == "file":
+            t = None
+        return {"date_field": d, "title_field": t, "filters": filters}
+    raw = config.get("columns")
+    columns = [c for c in dict.fromkeys(field_id(c) for c in (raw if isinstance(raw, list) else []))
+               if c is not None]
+    if strict and not columns:
+        raise HTTPException(400, "表示する項目を1つ以上選択してください")
+    sort = str(config.get("sort", "id"))
+    if sort not in ("id", "created_at", "updated_at") and field_id(sort) is None:
+        sort = "id"
+    return {"columns": columns, "sort": sort, "filters": filters,
+            "order": "asc" if config.get("order") == "asc" else "desc"}
+
+
+def get_views(conn, app: dict, user: dict, fields: list[dict]) -> list[dict]:
+    """ユーザーが使えるビューを並び順で返す。アプリの管理者には全ビューと公開範囲も返す。"""
+    manager, views = app["role"] == "manager", []
+    for r in conn.execute("SELECT * FROM views WHERE app_id = ? ORDER BY position, id",
+                          (app["id"],)).fetchall():
+        members = [m["user_id"] for m in conn.execute(
+            "SELECT user_id FROM view_members WHERE view_id = ?", (r["id"],))]
+        if not manager and r["access"] == "restricted" and user["id"] not in members:
+            continue
+        v = {"id": r["id"], "name": r["name"], "type": r["type"], "access": r["access"],
+             "config": clean_view_config(r["type"], json.loads(r["config"]), fields, False)}
+        if manager:
+            v["user_ids"] = members
+        views.append(v)
+    return views
+
+
+def save_view(conn, app_id: int, body: ViewIn, view_id: int | None) -> int:
+    name = body.name.strip()
+    if not 1 <= len(name) <= 50:
+        raise HTTPException(400, "ビュー名は1〜50文字で入力してください")
+    if body.type not in ("table", "calendar") or body.access not in ("all", "restricted"):
+        raise HTTPException(400, "ビューの種類または公開範囲が正しくありません")
+    config = json.dumps(clean_view_config(body.type, body.config, get_fields(conn, app_id), True))
+    ids = list(dict.fromkeys(body.user_ids)) if body.access == "restricted" else []
+    if ids and conn.execute(f"SELECT COUNT(*) FROM users WHERE id IN ({marks(ids)})",
+                            ids).fetchone()[0] != len(ids):
+        raise HTTPException(400, "存在しないユーザーが含まれています")
+    if view_id is None:
+        pos = conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM views WHERE app_id = ?",
+                           (app_id,)).fetchone()[0]
+        view_id = conn.execute(
+            "INSERT INTO views (app_id, name, type, config, access, position) VALUES (?,?,?,?,?,?)",
+            (app_id, name, body.type, config, body.access, pos)).lastrowid
+    else:
+        old = conn.execute("SELECT type FROM views WHERE id = ? AND app_id = ?",
+                           (view_id, app_id)).fetchone()
+        if not old:
+            raise HTTPException(404, "ビューが見つかりません")
+        if old["type"] != body.type:
+            raise HTTPException(400, "保存済みのビューの種類は変更できません")
+        conn.execute("UPDATE views SET name = ?, config = ?, access = ? WHERE id = ?",
+                     (name, config, body.access, view_id))
+    if body.make_default:
+        conn.execute("UPDATE views SET position = (SELECT MIN(position) - 1 FROM views "
+                     "WHERE app_id = ?) WHERE id = ?", (app_id, view_id))
+    conn.execute("DELETE FROM view_members WHERE view_id = ?", (view_id,))
+    conn.executemany("INSERT INTO view_members (view_id, user_id) VALUES (?,?)",
+                     [(view_id, uid) for uid in ids])
+    return view_id
 
 
 def get_record(conn, app_id: int, record_id: int):
@@ -950,6 +1064,29 @@ def update_access(app_id: int, body: AccessIn, user: User):
         conn.executemany("INSERT INTO app_members (app_id, user_id, role) VALUES (?,?,?)",
                          [(app_id, uid, role) for uid, role in members.items()])
     return read_access(app_id, user)
+
+
+@app.post("/api/apps/{app_id}/views", status_code=201)
+def create_view(app_id: int, body: ViewIn, user: User):
+    with connect() as conn:
+        get_app(conn, app_id, user, "manager")
+        return {"id": save_view(conn, app_id, body, None)}
+
+
+@app.put("/api/apps/{app_id}/views/{view_id}")
+def update_view(app_id: int, view_id: int, body: ViewIn, user: User):
+    with connect() as conn:
+        get_app(conn, app_id, user, "manager")
+        return {"id": save_view(conn, app_id, body, view_id)}
+
+
+@app.delete("/api/apps/{app_id}/views/{view_id}", status_code=204)
+def delete_view(app_id: int, view_id: int, user: User):
+    with connect() as conn:
+        get_app(conn, app_id, user, "manager")
+        if not conn.execute("DELETE FROM views WHERE id = ? AND app_id = ?",
+                            (view_id, app_id)).rowcount:
+            raise HTTPException(404, "ビューが見つかりません")
 
 
 @app.put("/api/apps/{app_id}/fields")
