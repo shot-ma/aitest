@@ -863,3 +863,35 @@ def test_custom_holidays(client):
     assert client.delete(f"/api/holidays/{shared['id']}").status_code == 204
     assert names(sato) == []
     assert sato.get("/api/holidays", params={"year": 99999}).status_code == 400
+
+
+def test_datetime_field(client):
+    a = client.post("/api/apps", json={"name": "予定"}).json()
+    base = f"/api/apps/{a['id']}"
+    title, at = (str(f["id"]) for f in client.put(f"{base}/fields", json={"fields": [
+        {"label": "件名", "type": "text"}, {"label": "日時", "type": "datetime", "required": True}]}).json())
+    add = lambda t, v: client.post(f"{base}/records", json={"data": {title: t, at: v}})
+
+    # いろいろな書き方を受け付け、「YYYY-MM-DDTHH:MM」で保存する
+    for raw, saved in [("2026-11-17T09:30", "2026-11-17T09:30"), ("2026-11-17 14:05", "2026-11-17T14:05"),
+                       ("2026/11/30 9:00", "2026-11-30T09:00"), ("2026-12-01T00:00:59", "2026-12-01T00:00")]:
+        r = add(raw, raw)
+        assert r.status_code == 201 and r.json()["data"][at] == saved, (raw, r.text)
+    for bad in ("2026-11-17", "2026-13-01 10:00", "2026-11-17 25:00", "きょう 10時", "2026-11-17T9"):
+        assert add("x", bad).status_code == 422, bad
+
+    # 日付の範囲指定は日付の部分で比べる（月末の時刻つきも含まれる）
+    rng = client.get(f"{base}/records", params={f"f_{at}_from": "2026-11-01", f"f_{at}_to": "2026-11-30", "sort": at, "order": "asc"}).json()
+    assert [r["data"][at] for r in rng["records"]] == ["2026-11-17T09:30", "2026-11-17T14:05", "2026-11-30T09:00"]
+    # 集計は日ごと、CSV は「日付 時刻」で書き出し、取り込める
+    agg = client.get(f"{base}/aggregate", params={"group": at}).json()["groups"]
+    assert [(g["key"], g["count"]) for g in agg] == [("2026-11-17", 2), ("2026-11-30", 1), ("2026-12-01", 1)]
+    assert "2026-11-17 09:30" in client.get(f"{base}/export.csv").text
+    imp = client.post(f"{base}/import", files={"file": ("a.csv", "件名,日時\n取込,2026/11/20 13:00\n".encode(), "text/csv")}).json()
+    assert imp == {"imported": 1, "errors": []}
+
+    # カレンダーの基準・ダッシュボードのカレンダーに使える
+    v = client.post(f"{base}/views", json={"name": "予定表", "type": "calendar", "config": {"date_field": int(at)}})
+    assert v.status_code == 201
+    assert client.get("/api/dashboard/options").json()[0]["has_date"] is True
+    assert client.put("/api/dashboard", json={"widgets": [{"app_id": a["id"], "mode": "calendar", "x": 0, "y": 0}]}).status_code == 200

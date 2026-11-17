@@ -35,6 +35,7 @@ FIELD_TYPES = {
     "textarea": "文字列（複数行）",
     "number": "数値",
     "date": "日付",
+    "datetime": "日時（日付＋時刻）",
     "time": "時刻",
     "select": "メニュー",
     "radio": "ラジオボタン",
@@ -46,7 +47,8 @@ FIELD_TYPES = {
 }
 CHOICE_TYPES = {"select", "radio", "multi"}
 # 参照項目で「表示に使う項目」として選べる型
-LOOKUP_DISPLAY_TYPES = ["text", "number", "date", "time", "select", "radio", "url"]
+LOOKUP_DISPLAY_TYPES = ["text", "number", "date", "datetime", "time", "select", "radio", "url"]
+DATE_TYPES = {"date", "datetime"}  # カレンダーの基準や日付の範囲指定に使える型
 
 TEMPLATES = {
     "customers": {
@@ -605,7 +607,7 @@ def clean_view_config(vtype: str, config: dict, fields: list[dict], strict: bool
             filters[str(f["id"])] = v
     if vtype == "calendar":
         d, t = field_id(config.get("date_field")), field_id(config.get("title_field"))
-        if d is None or by_id[d]["type"] != "date":
+        if d is None or by_id[d]["type"] not in DATE_TYPES:
             if strict:
                 raise HTTPException(400, "カレンダーの基準にする日付項目を選択してください")
             d = None
@@ -808,6 +810,7 @@ def check_lookup(conn, f: FieldIn, old: dict | None, user: dict):
 ERROR_MESSAGES = {
     "number": "数値で入力してください",
     "date": "日付の形式が正しくありません（例: 2026-01-31）",
+    "datetime": "日時の形式が正しくありません（例: 2026-01-31 09:30）",
     "time": "時刻の形式が正しくありません（例: 09:30）",
     "url": "http:// または https:// で始まる URL を入力してください",
     "file": f"添付ファイルが正しくありません（1項目 {MAX_FILES_PER_FIELD} 件まで）",
@@ -849,6 +852,13 @@ def validate_record(conn, app_id: int, fields: list[dict], data: dict, user: dic
                 v = int(n) if n == int(n) else n
             elif t == "date":
                 v = date.fromisoformat(str(v).replace("/", "-")).isoformat()
+            elif t == "datetime":
+                # 「2026-01-31T09:30」「2026/1/31 9:30」などを受け付け、分単位の「YYYY-MM-DDTHH:MM」で保存する
+                m = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T ](\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?",
+                                 str(v))
+                if not m:
+                    raise ValueError
+                v = datetime(*map(int, m.groups())).strftime("%Y-%m-%dT%H:%M")
             elif t == "time":
                 v = time.fromisoformat(str(v)).strftime("%H:%M")
             elif t in ("select", "radio"):
@@ -914,12 +924,15 @@ def build_where(app_id: int, fields: list[dict], params, hidden=()) -> tuple[str
         args += [f"%{esc}%", f"%{esc}%", *hidden]
     for f in fields:
         path = f'$."{f["id"]}"'  # 項目IDは整数なので SQL に埋め込んでも安全
-        if f["type"] == "date":
-            # 日付は範囲でも絞り込める（f_<項目ID>_from / _to。カレンダー表示で使う）
+        if f["type"] in DATE_TYPES:
+            # 日付・日時は日付の範囲でも絞り込める（f_<項目ID>_from / _to。カレンダー表示で使う）
+            # 日時は日付の部分（先頭10文字）で比べる
+            expr = (f"json_extract(data, '{path}')" if f["type"] == "date"
+                    else f"substr(json_extract(data, '{path}'), 1, 10)")
             for suffix, op in (("from", ">="), ("to", "<=")):
                 d = params.get(f"f_{f['id']}_{suffix}")
                 if d:
-                    where.append(f"json_extract(data, '{path}') {op} ?")
+                    where.append(f"{expr} {op} ?")
                     args.append(d)
         v = params.get(f"f_{f['id']}")
         if v in (None, ""):
@@ -950,6 +963,8 @@ def display(f: dict, rec: dict) -> str:
         return rec["refs"][str(f["id"])]["label"] or ""
     if f["type"] == "check":
         return "1" if v else "0"
+    if f["type"] == "datetime":
+        return v.replace("T", " ")
     return str(v)
 
 
@@ -1585,7 +1600,7 @@ def widget_target(conn, user: dict, app_id: int, view_id, mode: str, cache: dict
     if view_id is not None:
         view = next((v for v in a["views"] if v["id"] == view_id), None)
         return (a, view) if view else None
-    if mode == "calendar" and not any(f["type"] == "date" for f in a["fields"]):
+    if mode == "calendar" and not any(f["type"] in DATE_TYPES for f in a["fields"]):
         return None
     return (a, None) if mode in ("list", "calendar") else None
 
@@ -1691,7 +1706,7 @@ def dashboard_options(user: User):
             fields = split_fields(a, user, get_fields(conn, a["id"]))[0]
             result.append({
                 "app_id": a["id"], "name": a["name"], "icon": a["icon"],
-                "has_date": any(f["type"] == "date" for f in fields),
+                "has_date": any(f["type"] in DATE_TYPES for f in fields),
                 "views": [{"id": v["id"], "name": v["name"], "type": v["type"]}
                           for v in get_views(conn, a, user, fields)]})
         return result
@@ -1802,6 +1817,8 @@ def aggregate(app_id: int, group: int, user: User, sum: int | None = None):
                 keys = ["オン" if v else "オフ"]
             elif gf["type"] == "multi":
                 keys = v or ["（未入力）"]
+            elif gf["type"] == "datetime" and v:
+                keys = [v[:10]]  # 日時は日ごとにまとめる
             elif gf["type"] == "lookup" and v is not None:
                 ref = rec["refs"][str(group)]
                 keys = [ref["label"] or ("（権限なし）" if ref["restricted"] else "（削除済み）")]

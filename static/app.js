@@ -544,7 +544,7 @@ function viewBar(app, view, mode) {
     },
       app.views.map((v, i) => h('option', { value: `view/${v.id}` }, `${v.type === 'calendar' ? '📅' : '📋'} ${v.name}${i === 0 ? '（既定）' : ''}`)),
       h('option', { value: 'list' }, '📋 すべての項目（標準）'),
-      app.fields.some(f => f.type === 'date') && h('option', { value: 'calendar' }, '📅 カレンダー（標準）'))),
+      app.fields.some(f => ['date', 'datetime'].includes(f.type)) && h('option', { value: 'calendar' }, '📅 カレンダー（標準）'))),
     manager && view && h('span', { class: 'chip' }, view.access === 'restricted' ? `🔒 ${view.user_ids.length} 人に公開` : '全員に公開'),
     h('span', { class: 'spacer' }),
     manager && view && h('button', { onclick: () => viewDialog(app, view) }, 'このビューを編集'),
@@ -554,7 +554,7 @@ function viewBar(app, view, mode) {
 async function viewDialog(app, view, mode) {
   const directory = await api('GET', '/api/users/directory');
   const cfg = view ? view.config : {};
-  const dateFields = app.fields.filter(f => f.type === 'date');
+  const dateFields = app.fields.filter(f => ['date', 'datetime'].includes(f.type));
   const check = (label, checked) => { const box = h('input', { type: 'checkbox', checked }); return [box, h('label', {}, box, ' ' + label)]; };
   const fieldOptions = list => list.map(f => h('option', { value: String(f.id) }, f.label));
 
@@ -666,6 +666,7 @@ function cellContent(f, v, refs) {
   if (f.type === 'select' || f.type === 'radio') return h('span', { class: 'chip' }, v);
   if (f.type === 'check') return v ? '✓' : '';
   if (f.type === 'number') return Number(v).toLocaleString('ja-JP');
+  if (f.type === 'datetime') return v.replace('T', ' ');
   if (f.type === 'url' && /^https?:\/\//.test(v)) {
     return h('a', { href: v, target: '_blank', rel: 'noopener noreferrer', onclick: stop }, v);
   }
@@ -830,7 +831,7 @@ function fieldInput(f, value, ref) {
       return [h('label', { style: 'font-weight:400' }, box, ' オン'), () => box.checked];
     }
     default: {
-      const type = { number: 'number', date: 'date', time: 'time', url: 'url' }[f.type] || 'text';
+      const type = { number: 'number', date: 'date', datetime: 'datetime-local', time: 'time', url: 'url' }[f.type] || 'text';
       const el = h('input', { type, value: value ?? '', class: type === 'text' || type === 'url' ? 'wide' : '', step: type === 'number' ? 'any' : null });
       return [el, () => el.value];
     }
@@ -956,6 +957,7 @@ function plainText(f, r) {
   if (f.type === 'multi') return v.join('、');
   if (f.type === 'check') return v ? `✓ ${f.label}` : '';
   if (f.type === 'number') return Number(v).toLocaleString('ja-JP');
+  if (f.type === 'datetime') return v.replace('T', ' ');
   if (f.type === 'lookup') { const ref = r.refs[f.id]; return ref.label ?? (ref.restricted ? '（権限なし）' : '（削除済み）'); }
   return String(v);
 }
@@ -964,7 +966,7 @@ const ymd = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
 
 // compact: ダッシュボードの中に表示するとき（日付項目・表示項目の切り替えを出さない）
 async function viewCalendar(app, root, view, compact = false) {
-  const dateFields = app.fields.filter(f => f.type === 'date');
+  const dateFields = app.fields.filter(f => ['date', 'datetime'].includes(f.type));
   if (!dateFields.length) {
     fill(root, h('div', { class: 'panel empty' }, 'カレンダー表示には日付項目が必要です。'));
     return;
@@ -999,7 +1001,11 @@ async function viewCalendar(app, root, view, compact = false) {
     if (records.length >= res.total || !res.records.length) break;
   }
   const byDay = {};
-  for (const r of records) (byDay[r.data[st.field]] ||= []).push(r);
+  // 日時の項目は日付の部分で日に振り分け、同じ日の中は時刻順に並べる
+  const timed = dateFields.find(f => f.id === st.field).type === 'datetime';
+  for (const r of records) (byDay[r.data[st.field].slice(0, 10)] ||= []).push(r);
+  if (timed) for (const list of Object.values(byDay)) list.sort((a, b) => a.data[st.field].localeCompare(b.data[st.field]));
+  const label = r => (timed ? r.data[st.field].slice(11, 16) + ' ' : '') + title(r);
   // 祝日と独自の休日（日付 → 一覧）
   const holidays = {};
   for (const x of await loadHolidays(st.year)) (holidays[x.date] ||= []).push(x);
@@ -1014,15 +1020,16 @@ async function viewCalendar(app, root, view, compact = false) {
     const dow = new Date(st.year, st.month, d).getDay();
     const hols = holidays[key] || [];
     const list = h('div', { class: 'cal-items' }, items.map(r => h('button', {
-      class: 'cal-item', title: title(r), onclick: () => recordDialog(app, r, reload),
-    }, title(r))));
+      class: 'cal-item', title: label(r), onclick: () => recordDialog(app, r, reload),
+    }, label(r))));
     cells.push(h('div', { class: 'cal-cell' + (key === today ? ' today' : '') + (hols.length || dow === 0 ? ' sun' : dow === 6 ? ' sat' : '') + (hols.length ? ' holiday' : '') },
       h('div', { class: 'cal-day' }, h('span', {}, String(d)),
         hols.length > 0 && h('span', { class: 'cal-hol', title: hols.map(x => x.name + HOLIDAY_KINDS[x.kind].suffix).join('、') },
           hols.map(x => x.name).join('・')),
         canEdit && dateFields.find(f => f.id === st.field).editable !== false && h('button', {
           class: 'cal-add', title: `${st.month + 1}月${d}日にレコードを追加`, 'aria-label': `${st.month + 1}月${d}日にレコードを追加`,
-          onclick: () => recordDialog(app, null, reload, { [st.field]: key }),
+          // 日時の項目には、その日の 9:00 を入れておく
+          onclick: () => recordDialog(app, null, reload, { [st.field]: timed ? `${key}T09:00` : key }),
         }, '＋')),
       list));
   }
