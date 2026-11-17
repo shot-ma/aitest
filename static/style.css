@@ -273,3 +273,14 @@ button.mini { padding: 1px 6px; font-size: .75rem; }
 .hol-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip-alt { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
 @media (max-width: 640px) { .cal-hol { display: none; } }
+
+/* カレンダー下の月・年の移動 */
+.cal-months { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; justify-content: center; }
+.cal-month-list { display: flex; flex-wrap: wrap; gap: 4px; justify-content: center; }
+.cal-month { padding: 4px 10px; min-width: 3.4em; }
+.cal-month.current { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.cal-year { white-space: nowrap; }
+@media (max-width: 640px) {
+  .cal-month-list { order: -1; width: 100%; display: grid; grid-template-columns: repeat(6, 1fr); }
+  .cal-month { min-width: 0; padding: 4px 0; }
+}

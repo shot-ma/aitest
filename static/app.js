@@ -1043,7 +1043,16 @@ async function viewCalendar(app, root, view, compact = false) {
       h('span', { class: 'muted' }, `${records.length} 件`)),
     h('div', { class: 'cal' },
       ['日', '月', '火', '水', '木', '金', '土'].map((w, i) => h('div', { class: 'cal-head' + (i === 0 ? ' sun' : i === 6 ? ' sat' : '') }, w)),
-      cells));
+      cells),
+    // 同じ年の各月と、前後の年へ直接移動する
+    !compact && h('nav', { class: 'cal-months', 'aria-label': '月の移動' },
+      h('button', { class: 'cal-year', onclick: () => { st.year--; reload(); } }, `‹ ${st.year - 1}年`),
+      h('div', { class: 'cal-month-list' }, Array.from({ length: 12 }, (_, m) => h('button', {
+        class: 'cal-month' + (m === st.month ? ' current' : ''),
+        'aria-current': m === st.month ? 'date' : null, 'aria-label': `${st.year}年${m + 1}月`,
+        onclick: () => { st.month = m; reload(); },
+      }, `${m + 1}月`))),
+      h('button', { class: 'cal-year', onclick: () => { st.year++; reload(); } }, `${st.year + 1}年 ›`)));
 }
 
 // ---------- 祝日・休日 ----------
