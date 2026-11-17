@@ -999,6 +999,9 @@ async function viewCalendar(app, root, view, compact = false) {
   }
   const byDay = {};
   for (const r of records) (byDay[r.data[st.field]] ||= []).push(r);
+  // 祝日と独自の休日（日付 → 一覧）
+  const holidays = {};
+  for (const x of await loadHolidays(st.year)) (holidays[x.date] ||= []).push(x);
 
   const move = d => { const t = new Date(st.year, st.month + d, 1); st.year = t.getFullYear(); st.month = t.getMonth(); reload(); };
   const today = ymd(now.getFullYear(), now.getMonth(), now.getDate());
@@ -1008,11 +1011,14 @@ async function viewCalendar(app, root, view, compact = false) {
     const key = ymd(st.year, st.month, d);
     const items = byDay[key] || [];
     const dow = new Date(st.year, st.month, d).getDay();
+    const hols = holidays[key] || [];
     const list = h('div', { class: 'cal-items' }, items.map(r => h('button', {
       class: 'cal-item', title: title(r), onclick: () => recordDialog(app, r, reload),
     }, title(r))));
-    cells.push(h('div', { class: 'cal-cell' + (key === today ? ' today' : '') + (dow === 0 ? ' sun' : dow === 6 ? ' sat' : '') },
+    cells.push(h('div', { class: 'cal-cell' + (key === today ? ' today' : '') + (hols.length || dow === 0 ? ' sun' : dow === 6 ? ' sat' : '') + (hols.length ? ' holiday' : '') },
       h('div', { class: 'cal-day' }, h('span', {}, String(d)),
+        hols.length > 0 && h('span', { class: 'cal-hol', title: hols.map(x => x.name + HOLIDAY_KINDS[x.kind].suffix).join('、') },
+          hols.map(x => x.name).join('・')),
         canEdit && dateFields.find(f => f.id === st.field).editable !== false && h('button', {
           class: 'cal-add', title: `${st.month + 1}月${d}日にレコードを追加`, 'aria-label': `${st.month + 1}月${d}日にレコードを追加`,
           onclick: () => recordDialog(app, null, reload, { [st.field]: key }),
@@ -1033,10 +1039,80 @@ async function viewCalendar(app, root, view, compact = false) {
       !compact && h('label', {}, '表示項目 ', h('select', {
         value: String(st.title), onchange: e => choose('title', Number(e.target.value)),
       }, titleFields.map(f => h('option', { value: String(f.id) }, f.label)))),
+      !compact && h('button', { onclick: () => holidayDialog(st.year, reload) }, '🎌 休日の設定'),
       h('span', { class: 'muted' }, `${records.length} 件`)),
     h('div', { class: 'cal' },
       ['日', '月', '火', '水', '木', '金', '土'].map((w, i) => h('div', { class: 'cal-head' + (i === 0 ? ' sun' : i === 6 ? ' sat' : '') }, w)),
       cells));
+}
+
+// ---------- 祝日・休日 ----------
+
+const HOLIDAY_KINDS = {
+  national: { label: '祝日', suffix: '' },
+  shared: { label: '全員共通', suffix: '（全員共通の休日）' },
+  personal: { label: '自分だけ', suffix: '（自分だけの休日）' },
+};
+const holidayCache = {}; // 年 → 読み込み中または読み込み済みの一覧
+const loadHolidays = year => (holidayCache[year] ||= api('GET', `/api/holidays?year=${year}`).catch(err => {
+  delete holidayCache[year]; toast('休日を読み込めませんでした: ' + err.message); return [];
+}));
+
+async function holidayDialog(year, onChange) {
+  const listEl = h('div', { class: 'hol-list' });
+  const yearSel = h('select', { 'aria-label': '表示する年', onchange: draw },
+    [year - 1, year, year + 1].map(y => h('option', { value: String(y), selected: y === year }, `${y}年`)));
+  const dateIn = h('input', { type: 'date', required: true, 'aria-label': '休日の日付' });
+  const nameIn = h('input', { required: true, maxLength: 50, placeholder: '例: 夏季休暇', 'aria-label': '休日の名前' });
+  const scope = h('select', { 'aria-label': '休日の対象' },
+    h('option', { value: 'personal' }, '自分だけ'), ME.role === 'admin' && h('option', { value: 'all' }, '全員共通'));
+  let changed = false;
+  async function draw() {
+    const y = Number(yearSel.value);
+    delete holidayCache[y];
+    const items = await loadHolidays(y);
+    fill(listEl, items.length ? items.map(x => h('div', { class: 'row hol-row' },
+      h('span', { class: 'hol-date' }, x.date.replace(/-/g, '/') + `（${'日月火水木金土'[new Date(x.date + 'T00:00').getDay()]}）`),
+      h('span', { class: 'hol-name' }, x.name),
+      h('span', { class: 'chip' + (x.kind === 'national' ? '' : ' chip-alt') }, HOLIDAY_KINDS[x.kind].label),
+      h('span', { class: 'spacer' }),
+      (x.kind === 'personal' || (x.kind === 'shared' && ME.role === 'admin')) && h('button', {
+        type: 'button', class: 'icon danger', title: '削除', 'aria-label': `${x.date} ${x.name} を削除`,
+        onclick: async () => {
+          if (!confirm(`「${x.name}」（${x.date}）を削除しますか？`)) return;
+          try { await api('DELETE', `/api/holidays/${x.id}`); changed = true; draw(); } catch (err) { toast(err.message); }
+        },
+      }, '✕')))
+      : h('div', { class: 'muted' }, 'この年の祝日・休日はありません（祝日は 2020〜2099 年に対応）。'));
+  }
+  const dlg = openDialog({
+    title: '祝日・休日の設定',
+    body: [
+      h('div', { class: 'form-field' }, h('div', { class: 'label' }, '休日を追加'),
+        h('div', { class: 'row' }, dateIn, nameIn, scope,
+          h('button', {
+            type: 'button', class: 'primary',
+            onclick: async () => {
+              if (!dateIn.value || !nameIn.value.trim()) return toast('日付と名前を入力してください');
+              try {
+                await api('POST', '/api/holidays', { date: dateIn.value, name: nameIn.value, scope: scope.value });
+                const y = Number(dateIn.value.slice(0, 4));
+                delete holidayCache[y]; changed = true;
+                nameIn.value = ''; toast('休日を追加しました');
+                if (![...yearSel.options].some(o => Number(o.value) === y)) yearSel.append(h('option', { value: String(y) }, `${y}年`));
+                yearSel.value = String(y); draw();
+              } catch (err) { toast(err.message); }
+            },
+          }, '追加')),
+        h('div', { class: 'muted' }, ME.role === 'admin'
+          ? '「全員共通」は全員のカレンダーに、「自分だけ」はあなたのカレンダーにだけ表示されます。'
+          : '追加した休日は、あなたのカレンダーにだけ表示されます。全員共通の休日はシステム管理者が登録します。')),
+      h('div', { class: 'row' }, h('div', { class: 'label', style: 'font-weight:600' }, '登録済みの祝日・休日'), h('span', { class: 'spacer' }), yearSel),
+      listEl,
+    ],
+  });
+  dlg.addEventListener('close', () => { if (changed) onChange(); });
+  draw();
 }
 
 // ---------- 集計 ----------

@@ -145,6 +145,15 @@ CREATE TABLE IF NOT EXISTS attachments (
     comment_id INTEGER,   -- コメントの添付（field_id は 0）。NULL ならレコードの添付か仮ファイル
     uploaded_by INTEGER
 );
+-- 独自の休日。owner_id が NULL なら全員共通（管理者が登録）、ユーザーID ならその人だけの休日
+CREATE TABLE IF NOT EXISTS holidays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    name TEXT NOT NULL,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_holidays_date ON holidays(date);
 -- ダッシュボードの配置。owner_id はユーザーID（0 は管理者が決める全員の既定）
 CREATE TABLE IF NOT EXISTS dashboards (
     owner_id INTEGER PRIMARY KEY,
@@ -266,6 +275,62 @@ def now() -> str:
     return datetime.now().isoformat(sep=" ", timespec="seconds")
 
 
+# ---------- 日本の祝日 ----------
+
+def nth_monday(year: int, month: int, n: int) -> date:
+    first = date(year, month, 1)
+    return first + timedelta(days=(7 - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def japanese_holidays(year: int) -> dict[date, str]:
+    """その年の日本の祝日（振替休日・国民の休日を含む）。
+
+    現行の祝日法（天皇誕生日が 2月23日になった 2020 年以降）の規則で計算する。
+    春分・秋分の日は 2099 年まで使える近似式による（正式には前年 2月の官報で決まる）。
+    """
+    if not 2020 <= year <= 2099:
+        return {}
+    d = date
+    equinox = lambda base: int(base + 0.242194 * (year - 1980) - (year - 1980) // 4)
+    h = {
+        d(year, 1, 1): "元日",
+        nth_monday(year, 1, 2): "成人の日",
+        d(year, 2, 11): "建国記念の日",
+        d(year, 2, 23): "天皇誕生日",
+        d(year, 3, equinox(20.8431)): "春分の日",
+        d(year, 4, 29): "昭和の日",
+        d(year, 5, 3): "憲法記念日",
+        d(year, 5, 4): "みどりの日",
+        d(year, 5, 5): "こどもの日",
+        nth_monday(year, 7, 3): "海の日",
+        d(year, 8, 11): "山の日",
+        nth_monday(year, 9, 3): "敬老の日",
+        d(year, 9, equinox(23.2488)): "秋分の日",
+        nth_monday(year, 10, 2): "スポーツの日",
+        d(year, 11, 3): "文化の日",
+        d(year, 11, 23): "勤労感謝の日",
+    }
+    # 東京オリンピック・パラリンピックに伴う移動（2020・2021 年のみ）
+    moved = {2020: {"海の日": d(2020, 7, 23), "スポーツの日": d(2020, 7, 24), "山の日": d(2020, 8, 10)},
+             2021: {"海の日": d(2021, 7, 22), "スポーツの日": d(2021, 7, 23), "山の日": d(2021, 8, 8)}}
+    for name, day in moved.get(year, {}).items():
+        h = {k: v for k, v in h.items() if v != name}
+        h[day] = name
+    # 国民の休日: 前日と翌日が祝日で、その日自体は祝日でない日
+    for day in sorted(h):
+        between = day + timedelta(days=1)
+        if between not in h and between + timedelta(days=1) in h and between.weekday() != 6:
+            h[between] = "国民の休日"
+    # 振替休日: 祝日が日曜日なら、その後の最初の祝日でない日
+    for day in sorted(h):
+        if day.weekday() == 6 and h[day] != "振替休日":
+            sub = day + timedelta(days=1)
+            while sub in h:
+                sub += timedelta(days=1)
+            h[sub] = "振替休日"
+    return dict(sorted(h.items()))
+
+
 # ---------- 認証 ----------
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -348,6 +413,12 @@ class RecordIn(BaseModel):
 class CommentIn(BaseModel):
     body: str = Field(default="", max_length=2000)
     file_ids: list[int] = []  # 先にアップロードしたコメント用ファイル
+
+
+class HolidayIn(BaseModel):
+    date: str
+    name: str
+    scope: str = "personal"  # personal（自分だけ）/ all（全員共通。システム管理者のみ）
 
 
 class WidgetIn(BaseModel):
@@ -1440,6 +1511,60 @@ def delete_comment(app_id: int, record_id: int, comment_id: int, user: User):
             raise HTTPException(403, "自分のコメントだけ削除できます")
         remove_files(conn, "comment_id = ?", [comment_id])
         conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+
+
+# ---------- API: 祝日・休日 ----------
+
+@app.get("/api/holidays")
+def list_holidays(year: int, user: User):
+    """その年の祝日と、全員共通の休日・自分だけの休日。日付順。"""
+    if not 1900 <= year <= 2200:
+        raise HTTPException(400, "年が正しくありません")
+    items = [{"id": None, "date": day.isoformat(), "name": name, "kind": "national"}
+             for day, name in japanese_holidays(year).items()]
+    with connect() as conn:
+        for r in conn.execute(
+                "SELECT * FROM holidays WHERE date LIKE ? AND (owner_id IS NULL OR owner_id = ?)",
+                (f"{year:04d}-%", user["id"])):
+            items.append({"id": r["id"], "date": r["date"], "name": r["name"],
+                          "kind": "personal" if r["owner_id"] else "shared"})
+    order = {"national": 0, "shared": 1, "personal": 2}
+    return sorted(items, key=lambda x: (x["date"], order[x["kind"]], x["id"] or 0))
+
+
+@app.post("/api/holidays", status_code=201)
+def add_holiday(body: HolidayIn, user: User):
+    try:
+        day = date.fromisoformat(body.date.strip().replace("/", "-")).isoformat()
+    except ValueError:
+        raise HTTPException(400, "日付の形式が正しくありません（例: 2026-08-13）")
+    name = body.name.strip()
+    if not 1 <= len(name) <= 50:
+        raise HTTPException(400, "休日の名前は1〜50文字で入力してください")
+    if body.scope not in ("personal", "all"):
+        raise HTTPException(400, "対象が正しくありません")
+    if body.scope == "all" and user["role"] != "admin":
+        raise HTTPException(403, "全員共通の休日はシステム管理者だけが登録できます")
+    owner = None if body.scope == "all" else user["id"]
+    with connect() as conn:
+        if conn.execute("SELECT 1 FROM holidays WHERE date = ? AND owner_id IS ?",
+                        (day, owner)).fetchone():
+            raise HTTPException(400, "その日はすでに登録されています")
+        hid = conn.execute("INSERT INTO holidays (date, name, owner_id, created_at) "
+                           "VALUES (?,?,?,?)", (day, name, owner, now())).lastrowid
+    return {"id": hid, "date": day, "name": name, "kind": "shared" if owner is None else "personal"}
+
+
+@app.delete("/api/holidays/{holiday_id}", status_code=204)
+def delete_holiday(holiday_id: int, user: User):
+    with connect() as conn:
+        row = conn.execute("SELECT owner_id FROM holidays WHERE id = ?", (holiday_id,)).fetchone()
+        # 他人の休日は存在を知らせない
+        if not row or (row["owner_id"] is not None and row["owner_id"] != user["id"]):
+            raise HTTPException(404, "休日が見つかりません")
+        if row["owner_id"] is None and user["role"] != "admin":
+            raise HTTPException(403, "全員共通の休日はシステム管理者だけが削除できます")
+        conn.execute("DELETE FROM holidays WHERE id = ?", (holiday_id,))
 
 
 # ---------- API: ダッシュボード ----------

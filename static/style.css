@@ -262,3 +262,14 @@ button.mini { padding: 1px 6px; font-size: .75rem; }
   .dash:not(.editing) { grid-template-columns: 1fr; grid-template-rows: none !important; grid-auto-rows: auto; }
   .dash:not(.editing) .widget { grid-column: 1 / -1 !important; grid-row: auto !important; height: calc(var(--h) * 120px); }
 }
+
+/* 祝日・休日 */
+.cal-cell.holiday { background: color-mix(in srgb, var(--danger) 6%, var(--surface)); }
+.cal-hol { flex: 1; min-width: 0; margin: 0 4px; font-size: .72rem; color: var(--danger); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cal-day { gap: 2px; }
+.hol-list { max-height: 46vh; overflow-y: auto; border-top: 1px solid var(--line); margin-top: 6px; }
+.hol-row { padding: 6px 0; border-bottom: 1px solid var(--line); flex-wrap: nowrap; }
+.hol-date { font-variant-numeric: tabular-nums; min-width: 9.5em; color: var(--muted); font-size: .9rem; }
+.hol-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-alt { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
+@media (max-width: 640px) { .cal-hol { display: none; } }

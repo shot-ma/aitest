@@ -815,3 +815,51 @@ def test_dashboard(client, inquiry):
     opts = sato.get("/api/dashboard/options").json()
     assert opts == [{"app_id": app_id, "name": "問い合わせ", "icon": "📋", "has_date": True, "views": []}]
     assert [v["name"] for v in client.get("/api/dashboard/options").json()[0]["views"]] == ["管理者用"]
+
+
+def test_japanese_holidays():
+    from datetime import date
+    from app.main import japanese_holidays
+    h = japanese_holidays(2026)
+    assert len(h) == 18
+    assert h[date(2026, 5, 6)] == "振替休日"          # こどもの日の前の憲法記念日が日曜
+    assert h[date(2026, 9, 22)] == "国民の休日"        # 敬老の日と秋分の日に挟まれた日
+    assert h[date(2026, 3, 20)] == "春分の日" and h[date(2026, 9, 23)] == "秋分の日"
+    assert japanese_holidays(2024)[date(2024, 2, 12)] == "振替休日"  # 建国記念の日が日曜
+    assert japanese_holidays(2025)[date(2025, 11, 24)] == "振替休日"
+    assert japanese_holidays(2021)[date(2021, 8, 9)] == "振替休日"   # 特例で日曜になった山の日
+    assert japanese_holidays(2020)[date(2020, 7, 24)] == "スポーツの日"
+    assert japanese_holidays(2019) == {}
+
+
+def test_custom_holidays(client):
+    sato, tanaka = new_user(client, "sato", "佐藤"), new_user(client, "tanaka", "田中")
+    get = lambda who, year=2026: who.get("/api/holidays", params={"year": year}).json()
+    national = get(sato)
+    assert len(national) == 18 and all(x["kind"] == "national" for x in national)
+
+    # 全員共通の休日はシステム管理者だけが登録・削除できる
+    add = lambda who, **kw: who.post("/api/holidays", json={"date": "2026-08-13", "name": "夏季休暇", **kw})
+    assert add(sato, scope="all").status_code == 403
+    shared = add(client, scope="all").json()
+    assert shared["kind"] == "shared"
+    assert add(client, scope="all").status_code == 400  # 同じ日の重複
+    # 自分だけの休日は誰でも登録でき、本人にだけ見える
+    mine = add(sato, date="2026/11/20", name="有給休暇").json()
+    assert mine == {"id": mine["id"], "date": "2026-11-20", "name": "有給休暇", "kind": "personal"}
+    assert add(sato, date="2026-13-01").status_code == 400
+    assert add(sato, name=" ").status_code == 400
+    assert add(sato, scope="team").status_code == 400
+
+    names = lambda who: [(x["date"], x["name"], x["kind"]) for x in get(who) if x["kind"] != "national"]
+    assert names(sato) == [("2026-08-13", "夏季休暇", "shared"), ("2026-11-20", "有給休暇", "personal")]
+    assert names(tanaka) == [("2026-08-13", "夏季休暇", "shared")]
+    assert get(sato, 2027) == [x for x in get(sato, 2027) if x["kind"] == "national"]
+
+    # 削除: 他人の休日は見えない、共通の休日は管理者だけ
+    assert tanaka.delete(f"/api/holidays/{mine['id']}").status_code == 404
+    assert sato.delete(f"/api/holidays/{shared['id']}").status_code == 403
+    assert sato.delete(f"/api/holidays/{mine['id']}").status_code == 204
+    assert client.delete(f"/api/holidays/{shared['id']}").status_code == 204
+    assert names(sato) == []
+    assert sato.get("/api/holidays", params={"year": 99999}).status_code == 400
