@@ -364,15 +364,16 @@ function renderDashboard(dash) {
   const rows = Math.max(...widgets.map(wd => wd.y + wd.h));
   const apps = {}; // 同じアプリの情報は1回だけ読む
   const getApp = id => (apps[id] ||= api('GET', `/api/apps/${id}`));
-  return h('div', { class: 'dash', style: `grid-template-rows:repeat(${rows}, var(--cell-h))` }, widgets.map(wd => {
+  // 行の高さは最低1マス分で、カレンダーの枠に合わせて伸びる
+  return h('div', { class: 'dash', style: `grid-template-rows:repeat(${rows}, minmax(var(--cell-h), auto))` }, widgets.map(wd => {
     const body = h('div', { class: 'widget-body' }, h('div', { class: 'muted' }, '読み込み中…'));
     (async () => {
       const app = await getApp(wd.app_id);
       const view = wd.view_id ? app.views.find(v => v.id === wd.view_id) : null;
-      if (wd.mode === 'calendar') await viewCalendar(app, body, view, true);
+      if (wd.mode === 'calendar') await viewCalendar(app, body, view); // アプリ画面と同じ大きさ・機能で表示
       else await widgetList(app, body, view, wd);
     })().catch(err => fill(body, h('div', { class: 'muted' }, err.message)));
-    return h('section', { class: 'widget', style: placeStyle(wd), 'aria-label': `${wd.app_name} ${wd.view_name}` },
+    return h('section', { class: 'widget ' + (wd.mode === 'calendar' ? 'cal-widget' : 'list-widget'), style: placeStyle(wd), 'aria-label': `${wd.app_name} ${wd.view_name}` },
       h('div', { class: 'widget-head' },
         h('span', {}, wd.app_icon), h('b', {}, wd.app_name), h('span', { class: 'muted' }, wd.view_name),
         h('span', { class: 'spacer' }), h('a', { href: viewLink(wd) }, '開く ›')),

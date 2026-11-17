@@ -246,10 +246,10 @@ fieldset:disabled a.file { pointer-events: auto; }
 .widget-table th, .widget-table td { padding: 4px 8px; font-size: .85rem; }
 .widget-table th { cursor: default; }
 .widget-foot { font-size: .8rem; margin-top: 6px; }
-.widget .cal { margin-top: 6px; }
-.widget .cal-title { font-size: .95rem; min-width: 6.5em; }
-.widget .cal-cell { min-height: 54px; }
-.widget .cal-item { font-size: .75rem; }
+/* カレンダーの枠はアプリ画面と同じ大きさで表示し、内容に合わせて高さが伸びる。
+   一覧の枠は指定の高さに固定し、行の高さ計算に影響しないよう大きさを封じ込める（中はスクロール） */
+.widget.list-widget { contain: size; }
+.widget.cal-widget .widget-body { overflow: visible; padding: 4px 12px 12px; }
 .dash-edit-wrap { overflow-x: auto; padding-bottom: 4px; }
 .dash.editing { grid-template-rows: repeat(10, 112px); min-width: 760px; }
 .dash-cell { border: 1px dashed var(--line); background: transparent; color: var(--muted); border-radius: var(--radius); font-size: 1.1rem; }
@@ -261,6 +261,7 @@ button.mini { padding: 1px 6px; font-size: .75rem; }
 @media (max-width: 640px) {
   .dash:not(.editing) { grid-template-columns: 1fr; grid-template-rows: none !important; grid-auto-rows: auto; }
   .dash:not(.editing) .widget { grid-column: 1 / -1 !important; grid-row: auto !important; height: calc(var(--h) * 120px); }
+  .dash:not(.editing) .widget.cal-widget { height: auto; min-height: calc(var(--h) * 120px); }
 }
 
 /* 祝日・休日 */
@@ -285,11 +286,11 @@ button.mini { padding: 1px 6px; font-size: .75rem; }
   .cal-month { min-width: 0; padding: 4px 0; }
 }
 
-/* ダッシュボード内の月・年の移動: 月を6列×2段、年の移動をその下に小さく並べる */
-.widget .cal-months { gap: 4px 6px; margin-top: 8px; }
-.widget .cal-month-list { order: -1; width: 100%; display: grid; grid-template-columns: repeat(6, 1fr); gap: 3px; }
-.widget .cal-month { min-width: 0; padding: 1px 0; font-size: .75rem; }
-.widget .cal-year { padding: 1px 8px; font-size: .75rem; }
+/* 1行に収まらない幅の枠では、スマホ幅のアプリ画面と同じく月のボタンを6列×2段に並べ、年の移動をその下にまとめる */
+@container (max-width: 900px) {
+  .widget .cal-month-list { order: -1; width: 100%; display: grid; grid-template-columns: repeat(6, 1fr); }
+  .widget .cal-month { min-width: 0; padding: 4px 0; }
+}
 /* 狭いダッシュボードの枠では祝日名が読めないほど切れるので、色だけで示す（名前はマウスを重ねると出る） */
 .widget { container-type: inline-size; }
 @container (max-width: 560px) { .widget .cal-hol { display: none; } }
