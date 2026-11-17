@@ -322,11 +322,24 @@ function appHeader(app, tab) {
 // ---------- アプリ一覧 ----------
 
 async function viewHome() {
-  const apps = await api('GET', '/api/apps');
-  fill(main, 
+  const [apps, dash] = await Promise.all([api('GET', '/api/apps'), api('GET', '/api/dashboard')]);
+  fill(main,
     h('div', { class: 'row' },
-      h('h1', {}, 'アプリ一覧'), h('span', { class: 'spacer' }),
-      h('button', { class: 'primary', onclick: newAppDialog }, '＋ アプリを作成')),
+      h('h1', {}, 'ダッシュボード'),
+      dash.custom && h('span', { class: 'chip', title: '既定の配置から変更しています' }, '自分用の配置'),
+      h('span', { class: 'spacer' }),
+      ME.role === 'admin' && h('button', { onclick: () => editDashboard(true) }, '全員の既定を編集'),
+      dash.custom && h('button', {
+        onclick: async () => {
+          if (!confirm('自分用の配置を消して、管理者が決めた既定の配置に戻しますか？')) return;
+          await api('DELETE', '/api/dashboard'); toast('既定の配置に戻しました'); route();
+        },
+      }, '既定に戻す'),
+      h('button', { class: 'primary', onclick: () => editDashboard(false) }, 'レイアウトを編集')),
+    renderDashboard(dash),
+    h('div', { class: 'row', style: 'margin-top:32px' },
+      h('h2', { style: 'margin:0' }, 'アプリ一覧'), h('span', { class: 'spacer' }),
+      h('button', { onclick: newAppDialog }, '＋ アプリを作成')),
     apps.length
       ? h('div', { class: 'cards' }, apps.map(a =>
           h('a', { class: 'card', href: `#/app/${a.id}` },
@@ -335,6 +348,155 @@ async function viewHome() {
             h('div', { class: 'muted' }, a.description),
             h('div', { class: 'muted' }, `${a.record_count} 件`))))
       : h('div', { class: 'panel empty' }, 'アプリがまだありません。「＋ アプリを作成」から始めましょう。'));
+}
+
+// ---------- ダッシュボード ----------
+
+const viewLink = wd => `#/app/${wd.app_id}/` + (wd.view_id ? `view/${wd.view_id}` : wd.mode === 'calendar' ? 'calendar' : 'list');
+const placeStyle = wd => `grid-column:${wd.x + 1} / span ${wd.w};grid-row:${wd.y + 1} / span ${wd.h};--h:${wd.h}`;
+
+function renderDashboard(dash) {
+  if (!dash.widgets.length) {
+    return h('div', { class: 'panel empty' }, 'ダッシュボードにビューがありません。「レイアウトを編集」から、よく使う一覧やカレンダーを並べられます。');
+  }
+  // 小さい画面では1列に並ぶので、上から・左からの順に並べておく
+  const widgets = [...dash.widgets].sort((a, b) => a.y - b.y || a.x - b.x);
+  const rows = Math.max(...widgets.map(wd => wd.y + wd.h));
+  const apps = {}; // 同じアプリの情報は1回だけ読む
+  const getApp = id => (apps[id] ||= api('GET', `/api/apps/${id}`));
+  return h('div', { class: 'dash', style: `grid-template-rows:repeat(${rows}, var(--cell-h))` }, widgets.map(wd => {
+    const body = h('div', { class: 'widget-body' }, h('div', { class: 'muted' }, '読み込み中…'));
+    (async () => {
+      const app = await getApp(wd.app_id);
+      const view = wd.view_id ? app.views.find(v => v.id === wd.view_id) : null;
+      if (wd.mode === 'calendar') await viewCalendar(app, body, view, true);
+      else await widgetList(app, body, view, wd);
+    })().catch(err => fill(body, h('div', { class: 'muted' }, err.message)));
+    return h('section', { class: 'widget', style: placeStyle(wd), 'aria-label': `${wd.app_name} ${wd.view_name}` },
+      h('div', { class: 'widget-head' },
+        h('span', {}, wd.app_icon), h('b', {}, wd.app_name), h('span', { class: 'muted' }, wd.view_name),
+        h('span', { class: 'spacer' }), h('a', { href: viewLink(wd) }, '開く ›')),
+      body);
+  }));
+}
+
+// ダッシュボード用の一覧。ビューの表示項目・並び順・絞り込みに従い、高さに合わせた件数を出す
+async function widgetList(app, root, view, wd) {
+  const cfg = view ? view.config : null;
+  const cols = cfg && cfg.columns.length ? app.fields.filter(f => cfg.columns.includes(f.id)) : app.fields;
+  const q = new URLSearchParams({ sort: cfg ? cfg.sort : 'id', order: cfg ? cfg.order : 'desc', per_page: wd.h * 4 });
+  if (cfg) for (const [id, v] of Object.entries(cfg.filters)) q.set('f_' + id, v);
+  const res = await api('GET', `/api/apps/${app.id}/records?${q}`);
+  const reload = () => widgetList(app, root, view, wd);
+  fill(root,
+    res.records.length
+      ? h('table', { class: 'widget-table' },
+          h('thead', {}, h('tr', {}, h('th', {}, 'No.'), cols.map(f => h('th', {}, f.label)))),
+          h('tbody', {}, res.records.map(r => h('tr', {
+            tabIndex: 0, onclick: () => recordDialog(app, r, reload),
+            onkeydown: e => { if (e.key === 'Enter') recordDialog(app, r, reload); },
+          }, h('td', { class: 'num' }, r.id), cols.map(f => h('td', { class: f.type === 'number' ? 'num' : '' }, cellContent(f, r.data[f.id], r.refs)))))))
+      : h('div', { class: 'muted' }, 'レコードがありません。'),
+    h('div', { class: 'muted widget-foot' }, `全 ${res.total} 件` + (res.total > res.records.length ? `（先頭 ${res.records.length} 件を表示）` : '')));
+}
+
+// 配置の編集画面。forDefault が true なら、管理者が全員の既定を編集する
+async function editDashboard(forDefault) {
+  const [dash, options] = await Promise.all([
+    api('GET', forDefault ? '/api/dashboard/default' : '/api/dashboard'), api('GET', '/api/dashboard/options')]);
+  const COLS = dash.cols, ROWS = dash.rows;
+  let items = dash.widgets.map(wd => ({ ...wd }));
+  let dragging = null;
+
+  const fits = (item, x, y, w, hh) => x >= 0 && y >= 0 && w >= 1 && hh >= 1 && x + w <= COLS && y + hh <= ROWS &&
+    !items.some(o => o !== item && x < o.x + o.w && o.x < x + w && y < o.y + o.h && o.y < y + hh);
+  function change(item, x, y, w, hh) {
+    if (!fits(item, x, y, w, hh)) return toast('その位置・大きさにはできません（マス目からはみ出すか、ほかのビューと重なります）');
+    Object.assign(item, { x, y, w, h: hh });
+    draw();
+  }
+  const grid = h('div', { class: 'dash editing' });
+  function draw() {
+    const cells = [];
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+      cells.push(h('button', {
+        class: 'dash-cell', style: `grid-column:${x + 1};grid-row:${y + 1}`,
+        title: 'ここにビューを追加', 'aria-label': `${y + 1}行目・${x + 1}列目にビューを追加`,
+        onclick: () => addWidget(x, y),
+        ondragover: e => { if (dragging && fits(dragging, x, y, dragging.w, dragging.h)) e.preventDefault(); },
+        ondrop: e => { e.preventDefault(); if (dragging) change(dragging, x, y, dragging.w, dragging.h); dragging = null; },
+      }, '＋'));
+    }
+    const btn = (label, title, fn) => h('button', { class: 'mini', title, 'aria-label': title, onclick: fn }, label);
+    fill(grid, cells, items.map(it => h('div', {
+      class: 'widget edit', style: placeStyle(it), draggable: true,
+      ondragstart: e => { dragging = it; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', ''); },
+      ondragend: () => { dragging = null; },
+    },
+      h('div', { class: 'widget-head' }, h('span', {}, it.app_icon), h('b', {}, it.app_name)),
+      h('div', { class: 'muted' }, `${it.mode === 'calendar' ? '📅' : '📋'} ${it.view_name}`),
+      h('div', { class: 'muted' }, `幅 ${it.w} × 高さ ${it.h}`),
+      h('div', { class: 'widget-tools' },
+        btn('←', '左へ移動', () => change(it, it.x - 1, it.y, it.w, it.h)),
+        btn('↑', '上へ移動', () => change(it, it.x, it.y - 1, it.w, it.h)),
+        btn('↓', '下へ移動', () => change(it, it.x, it.y + 1, it.w, it.h)),
+        btn('→', '右へ移動', () => change(it, it.x + 1, it.y, it.w, it.h)),
+        btn('幅−', '幅を狭く', () => change(it, it.x, it.y, it.w - 1, it.h)),
+        btn('幅＋', '幅を広く', () => change(it, it.x, it.y, it.w + 1, it.h)),
+        btn('高−', '高さを低く', () => change(it, it.x, it.y, it.w, it.h - 1)),
+        btn('高＋', '高さを高く', () => change(it, it.x, it.y, it.w, it.h + 1)),
+        btn('✕', 'ダッシュボードから外す', () => { items = items.filter(o => o !== it); draw(); })))));
+  }
+
+  function addWidget(x, y) {
+    if (!options.length) return toast('置けるアプリがありません');
+    const choices = [];
+    const select = h('select', { class: 'wide', 'aria-label': '表示するビュー' }, options.map(o => h('optgroup', { label: `${o.icon} ${o.name}` },
+      [{ view_id: null, mode: 'list', name: 'すべての項目（標準）' },
+       ...(o.has_date ? [{ view_id: null, mode: 'calendar', name: 'カレンダー（標準）' }] : []),
+       ...o.views.map(v => ({ view_id: v.id, mode: v.type === 'calendar' ? 'calendar' : 'list', name: v.name }))]
+        .map(v => {
+          choices.push({ app_id: o.app_id, app_name: o.name, app_icon: o.icon, view_id: v.view_id, mode: v.mode, view_name: v.name });
+          return h('option', { value: String(choices.length - 1) }, `${v.mode === 'calendar' ? '📅' : '📋'} ${v.name}`);
+        }))));
+    const size = (max, def) => h('select', {}, Array.from({ length: max }, (_, i) => h('option', { value: String(i + 1), selected: i + 1 === def }, String(i + 1))));
+    const w = size(COLS - x, Math.min(2, COLS - x)), hh = size(ROWS - y, Math.min(2, ROWS - y));
+    openDialog({
+      title: `${y + 1}行目・${x + 1}列目にビューを追加`, submitLabel: '追加',
+      body: [
+        h('div', { class: 'form-field' }, h('label', {}, '表示するビュー'), select),
+        h('div', { class: 'form-field row' }, h('label', {}, '幅（マス） ', w), h('label', {}, '高さ（マス） ', hh)),
+        h('div', { class: 'muted' }, `ダッシュボードは横 ${COLS} マス × 縦 ${ROWS} マスです。`),
+      ],
+      onSubmit: async () => {
+        const item = { ...choices[Number(select.value)], x, y, w: Number(w.value), h: Number(hh.value) };
+        if (!fits(item, x, y, item.w, item.h)) throw new Error('その大きさでは、マス目からはみ出すか、ほかのビューと重なります');
+        items.push(item); draw();
+      },
+    });
+  }
+
+  draw();
+  fill(main,
+    h('div', { class: 'row' },
+      h('h1', {}, forDefault ? '全員の既定ダッシュボードを編集' : 'ダッシュボードを編集'),
+      h('span', { class: 'spacer' }),
+      h('button', { onclick: () => route() }, 'キャンセル'),
+      h('button', {
+        class: 'primary',
+        onclick: async () => {
+          try {
+            await api('PUT', forDefault ? '/api/dashboard/default' : '/api/dashboard', {
+              widgets: items.map(({ app_id, view_id, mode, x, y, w, h: hh }) => ({ app_id, view_id, mode, x, y, w, h: hh })),
+            });
+            toast('ダッシュボードを保存しました'); route();
+          } catch (err) { toast(err.message); }
+        },
+      }, '保存')),
+    h('p', { class: 'muted' }, forDefault
+      ? '自分用に配置を変更していない全員に表示されます（各自が見る権限のないビューは、その人には表示されません）。'
+      : '空いているマスの「＋」でビューを追加し、ビューはドラッグか矢印ボタンで移動、幅・高さボタンで大きさを変えられます。'),
+    h('div', { class: 'dash-edit-wrap' }, grid));
 }
 
 function newAppDialog() {
@@ -732,20 +894,45 @@ function commentsSection(app, record, onChange) {
             await api('DELETE', `${url}/${c.id}`); await load(); onChange();
           },
         }, '✕')),
-      h('div', { class: 'comment-body' }, c.body)))
+      c.body && h('div', { class: 'comment-body' }, c.body),
+      c.files.length > 0 && h('div', { class: 'comment-files' }, c.files.map(fileLink))))
       : h('div', { class: 'muted' }, 'コメントはまだありません。'));
   }
   load().catch(err => toast(err.message));
+  // 添付ファイルは選んだ時点でアップロードし、投稿時に ID の一覧を送る
+  let pending = [];
+  const pendingEl = h('div', { class: 'comment-files' });
+  const drawPending = () => fill(pendingEl, pending.map(x => h('span', { class: 'pending-file' }, fileLink(x),
+    h('button', { type: 'button', class: 'icon danger', title: '添付を外す', 'aria-label': `${x.name} を外す`, onclick: () => { pending = pending.filter(y => y !== x); drawPending(); } }, '✕'))));
+  const fileInput = h('input', {
+    type: 'file', multiple: true, hidden: true, 'aria-label': 'コメントにファイルを添付',
+    onchange: async () => {
+      for (const file of fileInput.files) {
+        if (pending.length >= 10) { toast('添付できるファイルは10件までです'); break; }
+        if (file.size > META.max_file_size) { toast(`${file.name}: ファイルが大きすぎます（上限 ${META.max_file_size / 1048576}MB）`); continue; }
+        const fd = new FormData();
+        fd.append('file', file);
+        try { pending.push(await api('POST', `/api/apps/${app.id}/records/${record.id}/comment-files`, fd)); drawPending(); }
+        catch (err) { toast(`${file.name}: ${err.message}`); }
+      }
+      fileInput.value = '';
+    },
+  });
   return h('div', { class: 'comments' },
     h('h2', {}, 'コメント'), listEl,
     app.role !== 'viewer' && input,
+    app.role !== 'viewer' && pendingEl,
     app.role !== 'viewer' && h('div', { class: 'row' }, h('span', { class: 'muted' }, `${userName()} として投稿`), h('span', { class: 'spacer' }),
+      fileInput,
+      h('button', { type: 'button', onclick: () => fileInput.click() }, '📎 ファイルを添付'),
       h('button', {
         type: 'button',
         onclick: async () => {
-          if (!input.value.trim()) return;
-          try { await api('POST', url, { body: input.value }); input.value = ''; await load(); onChange(); }
-          catch (err) { toast(err.message); }
+          if (!input.value.trim() && !pending.length) return;
+          try {
+            await api('POST', url, { body: input.value, file_ids: pending.map(x => x.id) });
+            input.value = ''; pending = []; drawPending(); await load(); onChange();
+          } catch (err) { toast(err.message); }
         },
       }, 'コメントする')));
 }
@@ -774,7 +961,8 @@ function plainText(f, r) {
 const pad = n => String(n).padStart(2, '0');
 const ymd = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
 
-async function viewCalendar(app, root, view) {
+// compact: ダッシュボードの中に表示するとき（日付項目・表示項目の切り替えを出さない）
+async function viewCalendar(app, root, view, compact = false) {
   const dateFields = app.fields.filter(f => f.type === 'date');
   if (!dateFields.length) {
     fill(root, h('div', { class: 'panel empty' }, 'カレンダー表示には日付項目が必要です。'));
@@ -791,7 +979,7 @@ async function viewCalendar(app, root, view) {
   // 表示項目の既定は最初の1行文字列（無ければ先頭の項目）
   if (!titleFields.some(f => f.id === st.title)) st.title = (app.fields.find(f => f.type === 'text') || titleFields[0]).id;
   const choose = (key, value) => { st[key] = value; if (!view) calPrefs(app.id, { field: st.field, title: st.title }); reload(); };
-  const reload = () => viewCalendar(app, root, view);
+  const reload = () => viewCalendar(app, root, view, compact);
   const canEdit = app.role !== 'viewer';
   const titleField = titleFields.find(f => f.id === st.title);
   const title = r => plainText(titleField, r) || `No.${r.id}`; // 値が空のレコードは番号で表示
@@ -833,16 +1021,16 @@ async function viewCalendar(app, root, view) {
   }
 
   fill(root,
-    h('div', { class: 'row', style: 'margin-top:14px' },
+    h('div', { class: 'row', style: compact ? '' : 'margin-top:14px' },
       h('button', { class: 'icon', 'aria-label': '前の月', onclick: () => move(-1) }, '‹'),
       h('strong', { class: 'cal-title' }, `${st.year}年${st.month + 1}月`),
       h('button', { class: 'icon', 'aria-label': '次の月', onclick: () => move(1) }, '›'),
       h('button', { onclick: () => { st.year = now.getFullYear(); st.month = now.getMonth(); reload(); } }, '今月'),
       h('span', { class: 'spacer' }),
-      dateFields.length > 1 && h('label', {}, '日付項目 ', h('select', {
+      !compact && dateFields.length > 1 && h('label', {}, '日付項目 ', h('select', {
         value: String(st.field), onchange: e => choose('field', Number(e.target.value)),
       }, dateFields.map(f => h('option', { value: String(f.id) }, f.label)))),
-      h('label', {}, '表示項目 ', h('select', {
+      !compact && h('label', {}, '表示項目 ', h('select', {
         value: String(st.title), onchange: e => choose('title', Number(e.target.value)),
       }, titleFields.map(f => h('option', { value: String(f.id) }, f.label)))),
       h('span', { class: 'muted' }, `${records.length} 件`)),

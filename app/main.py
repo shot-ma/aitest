@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 添付ファイル1件あたりの上限
 MAX_FILES_PER_FIELD = 10
+MAX_FILES_PER_COMMENT = 10
+GRID_COLS, GRID_ROWS = 5, 10  # ダッシュボードのマス目（横 × 縦）
 SESSION_DAYS = 14
 MAX_LOGIN_FAILURES = 5
 # アプリに対する権限の強さ。none < viewer（閲覧）< editor（編集）< manager（管理）
@@ -139,7 +141,15 @@ CREATE TABLE IF NOT EXISTS attachments (
     name TEXT NOT NULL,
     size INTEGER NOT NULL,
     stored TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    comment_id INTEGER,   -- コメントの添付（field_id は 0）。NULL ならレコードの添付か仮ファイル
+    uploaded_by INTEGER
+);
+-- ダッシュボードの配置。owner_id はユーザーID（0 は管理者が決める全員の既定）
+CREATE TABLE IF NOT EXISTS dashboards (
+    owner_id INTEGER PRIMARY KEY,
+    layout TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,6 +227,8 @@ MIGRATIONS = [
     ("records", "created_by_id", "INTEGER"),
     ("comments", "author_id", "INTEGER"),
     ("apps", "default_role", "TEXT NOT NULL DEFAULT 'editor'"),
+    ("attachments", "comment_id", "INTEGER"),
+    ("attachments", "uploaded_by", "INTEGER"),
 ]
 
 _initialized: set[str] = set()
@@ -334,7 +346,22 @@ class RecordIn(BaseModel):
 
 
 class CommentIn(BaseModel):
-    body: str = Field(min_length=1, max_length=2000)
+    body: str = Field(default="", max_length=2000)
+    file_ids: list[int] = []  # 先にアップロードしたコメント用ファイル
+
+
+class WidgetIn(BaseModel):
+    app_id: int
+    view_id: int | None = None  # None ならアプリ標準の一覧（mode=list）かカレンダー（mode=calendar）
+    mode: str = "list"
+    x: int  # 左上のマスの位置（0 始まり）
+    y: int
+    w: int = 1  # 幅と高さ（マス数）
+    h: int = 1
+
+
+class DashboardIn(BaseModel):
+    widgets: list[WidgetIn]
 
 
 class FollowIn(BaseModel):
@@ -1322,6 +1349,8 @@ def delete_record(app_id: int, record_id: int, user: User):
         a = get_app(conn, app_id, user, "editor")
         old = get_record(conn, app_id, record_id)
         remove_files(conn, "record_id = ?", [record_id])
+        remove_files(conn, "comment_id IN (SELECT id FROM comments WHERE record_id = ?)",
+                     [record_id])
         conn.execute("DELETE FROM records WHERE id = ?", (record_id,))
         notify(conn, a, None, user,
                f"{user['display_name']} さんがレコード No.{record_id} を削除しました",
@@ -1330,35 +1359,72 @@ def delete_record(app_id: int, record_id: int, user: User):
 
 # ---------- API: コメント ----------
 
+def comment_rows(conn, where: str, args) -> list[dict]:
+    """コメントを添付ファイルの一覧つきで返す。"""
+    rows = [dict(r) for r in conn.execute(f"SELECT * FROM comments WHERE {where} ORDER BY id", args)]
+    files: dict[int, list] = {}
+    ids = [r["id"] for r in rows]
+    if ids:
+        for f in conn.execute(f"SELECT id, name, size, comment_id FROM attachments "
+                              f"WHERE comment_id IN ({marks(ids)}) ORDER BY id", ids):
+            files.setdefault(f["comment_id"], []).append(
+                {"id": f["id"], "name": f["name"], "size": f["size"]})
+    return [{**r, "files": files.get(r["id"], [])} for r in rows]
+
+
 @app.get("/api/apps/{app_id}/records/{record_id}/comments")
 def list_comments(app_id: int, record_id: int, user: User):
     with connect() as conn:
         get_app(conn, app_id, user)
         get_record(conn, app_id, record_id)
-        rows = conn.execute("SELECT * FROM comments WHERE record_id = ? ORDER BY id",
-                            (record_id,))
-        return [dict(r) for r in rows]
+        return comment_rows(conn, "record_id = ?", [record_id])
+
+
+@app.post("/api/apps/{app_id}/records/{record_id}/comment-files", status_code=201)
+async def upload_comment_file(app_id: int, record_id: int, user: User,
+                              file: UploadFile = File(...)):
+    """コメント用のファイルを仮アップロードする。コメント投稿時にそのコメントへ紐付けられる。"""
+    with connect() as conn:
+        get_app(conn, app_id, user, "editor")
+        get_record(conn, app_id, record_id)
+    return await store_upload(file, app_id, 0, user)
 
 
 @app.post("/api/apps/{app_id}/records/{record_id}/comments", status_code=201)
 def add_comment(app_id: int, record_id: int, body: CommentIn, user: User):
     name, text = user["display_name"], body.body.strip()
-    if not text:
-        raise HTTPException(400, "コメントを入力してください")
+    file_ids = list(dict.fromkeys(body.file_ids))
+    if not text and not file_ids:
+        raise HTTPException(400, "コメントを入力するか、ファイルを添付してください")
+    if len(file_ids) > MAX_FILES_PER_COMMENT:
+        raise HTTPException(400, f"添付できるファイルは {MAX_FILES_PER_COMMENT} 件までです")
     with connect() as conn:
         a = get_app(conn, app_id, user, "editor")
         rec = get_record(conn, app_id, record_id)
+        if file_ids:
+            # 自分がこのアプリにアップロードした、まだどこにも紐付いていないファイルだけを使える
+            found = conn.execute(
+                f"SELECT COUNT(*) FROM attachments WHERE id IN ({marks(file_ids)}) AND app_id = ? "
+                "AND field_id = 0 AND comment_id IS NULL AND uploaded_by = ?",
+                [*file_ids, app_id, user["id"]]).fetchone()[0]
+            if found != len(file_ids):
+                raise HTTPException(400, "添付ファイルが正しくありません。もう一度アップロードしてください")
         # レコードの作成者と、これまでにコメントした人にも知らせる
         others = [r["author_id"] for r in conn.execute(
             "SELECT DISTINCT author_id FROM comments WHERE record_id = ?", (record_id,))]
         cid = conn.execute(
             "INSERT INTO comments (record_id, author, author_id, body, created_at) "
             "VALUES (?,?,?,?,?)", (record_id, name, user["id"], text, now())).lastrowid
-        excerpt = text[:60] + ("…" if len(text) > 60 else "")
+        if file_ids:
+            conn.execute(f"UPDATE attachments SET comment_id = ? WHERE id IN ({marks(file_ids)})",
+                         [cid, *file_ids])
+        excerpt = (text[:60] + ("…" if len(text) > 60 else "")) if text else "（ファイルを添付）"
+        if text and file_ids:
+            excerpt += f" 📎{len(file_ids)}件"
         notify(conn, a, record_id, user,
                f"{name} さんがレコード No.{record_id} にコメントしました: {excerpt}",
                [rec["created_by_id"], *others])
-        return dict(conn.execute("SELECT * FROM comments WHERE id = ?", (cid,)).fetchone())
+        return comment_rows(conn, "id = ?", [cid])[0]
 
 
 @app.delete("/api/apps/{app_id}/records/{record_id}/comments/{comment_id}", status_code=204)
@@ -1372,7 +1438,138 @@ def delete_comment(app_id: int, record_id: int, comment_id: int, user: User):
             raise HTTPException(404, "コメントが見つかりません")
         if row["author_id"] != user["id"] and a["role"] != "manager":
             raise HTTPException(403, "自分のコメントだけ削除できます")
+        remove_files(conn, "comment_id = ?", [comment_id])
         conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+
+
+# ---------- API: ダッシュボード ----------
+
+def widget_target(conn, user: dict, app_id: int, view_id, mode: str, cache: dict):
+    """ウィジェットが指すアプリとビューを、このユーザーが使えるなら (アプリ, ビュー) で返す。"""
+    if app_id not in cache:
+        row = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
+        a = None
+        if row and app_role(conn, dict(row), user) != "none":
+            a = get_app(conn, app_id, user)
+            fields = split_fields(a, user, get_fields(conn, app_id))[0]
+            a = {**a, "fields": fields, "views": get_views(conn, a, user, fields)}
+        cache[app_id] = a
+    a = cache[app_id]
+    if a is None:
+        return None
+    if view_id is not None:
+        view = next((v for v in a["views"] if v["id"] == view_id), None)
+        return (a, view) if view else None
+    if mode == "calendar" and not any(f["type"] == "date" for f in a["fields"]):
+        return None
+    return (a, None) if mode in ("list", "calendar") else None
+
+
+def check_layout(conn, widgets: list[WidgetIn], user: dict) -> list[dict]:
+    """配置を検証して保存用の形にする。マス目からはみ出す・重なる・使えないビューはエラー。"""
+    used, cache, result = set(), {}, []
+    for wd in widgets:
+        if not (0 <= wd.x and 0 <= wd.y and 1 <= wd.w and 1 <= wd.h
+                and wd.x + wd.w <= GRID_COLS and wd.y + wd.h <= GRID_ROWS):
+            raise HTTPException(400, f"ウィジェットが {GRID_COLS}×{GRID_ROWS} のマス目からはみ出しています")
+        cells = {(cx, cy) for cx in range(wd.x, wd.x + wd.w) for cy in range(wd.y, wd.y + wd.h)}
+        if cells & used:
+            raise HTTPException(400, "ウィジェットが重なっています")
+        used |= cells
+        target = widget_target(conn, user, wd.app_id, wd.view_id, wd.mode, cache)
+        if not target:
+            raise HTTPException(400, "表示できないビューが含まれています")
+        view = target[1]
+        mode = ("calendar" if view["type"] == "calendar" else "list") if view else wd.mode
+        result.append({"app_id": wd.app_id, "view_id": wd.view_id, "mode": mode,
+                       "x": wd.x, "y": wd.y, "w": wd.w, "h": wd.h})
+    return result
+
+
+def present_layout(conn, layout: list[dict], user: dict) -> list[dict]:
+    """保存された配置のうち、このユーザーが使えるウィジェットだけを、表示用の名前つきで返す。
+
+    既定の配置に権限のないビューがあったり、ビューやアプリが削除されたりした場合はそのウィジェットを省く。
+    """
+    cache, result = {}, []
+    for wd in layout:
+        target = widget_target(conn, user, wd["app_id"], wd["view_id"], wd["mode"], cache)
+        if not target:
+            continue
+        a, view = target
+        result.append({**wd, "app_name": a["name"], "app_icon": a["icon"],
+                       "view_name": view["name"] if view else
+                       ("カレンダー（標準）" if wd["mode"] == "calendar" else "すべての項目（標準）")})
+    return result
+
+
+def load_layout(conn, owner_id: int) -> list[dict] | None:
+    row = conn.execute("SELECT layout FROM dashboards WHERE owner_id = ?", (owner_id,)).fetchone()
+    return json.loads(row["layout"]) if row else None
+
+
+def save_layout(conn, owner_id: int, layout: list[dict]):
+    conn.execute("INSERT INTO dashboards (owner_id, layout, updated_at) VALUES (?,?,?) "
+                 "ON CONFLICT(owner_id) DO UPDATE SET layout = excluded.layout, "
+                 "updated_at = excluded.updated_at",
+                 (owner_id, json.dumps(layout), now()))
+
+
+@app.get("/api/dashboard")
+def read_dashboard(user: User):
+    """自分の配置。自分で変更していなければ管理者が決めた既定の配置を返す。"""
+    with connect() as conn:
+        own = load_layout(conn, user["id"])
+        layout = own if own is not None else load_layout(conn, 0) or []
+        return {"cols": GRID_COLS, "rows": GRID_ROWS, "custom": own is not None,
+                "widgets": present_layout(conn, layout, user)}
+
+
+@app.put("/api/dashboard")
+def update_dashboard(body: DashboardIn, user: User):
+    with connect() as conn:
+        save_layout(conn, user["id"], check_layout(conn, body.widgets, user))
+    return read_dashboard(user)
+
+
+@app.delete("/api/dashboard")
+def reset_dashboard(user: User):
+    """自分の配置を消して、既定の配置に戻す。"""
+    with connect() as conn:
+        conn.execute("DELETE FROM dashboards WHERE owner_id = ?", (user["id"],))
+    return read_dashboard(user)
+
+
+@app.get("/api/dashboard/default")
+def read_default_dashboard(admin: Admin):
+    with connect() as conn:
+        return {"cols": GRID_COLS, "rows": GRID_ROWS,
+                "widgets": present_layout(conn, load_layout(conn, 0) or [], admin)}
+
+
+@app.put("/api/dashboard/default")
+def update_default_dashboard(body: DashboardIn, admin: Admin):
+    with connect() as conn:
+        save_layout(conn, 0, check_layout(conn, body.widgets, admin))
+    return read_default_dashboard(admin)
+
+
+@app.get("/api/dashboard/options")
+def dashboard_options(user: User):
+    """ダッシュボードに置けるもの（このユーザーが使えるアプリとビュー）の一覧。"""
+    with connect() as conn:
+        result = []
+        for row in conn.execute("SELECT * FROM apps ORDER BY id").fetchall():
+            if app_role(conn, dict(row), user) == "none":
+                continue
+            a = get_app(conn, row["id"], user)
+            fields = split_fields(a, user, get_fields(conn, a["id"]))[0]
+            result.append({
+                "app_id": a["id"], "name": a["name"], "icon": a["icon"],
+                "has_date": any(f["type"] == "date" for f in fields),
+                "views": [{"id": v["id"], "name": v["name"], "type": v["type"]}
+                          for v in get_views(conn, a, user, fields)]})
+        return result
 
 
 # ---------- API: 添付ファイル ----------
@@ -1388,6 +1585,11 @@ async def upload_file(app_id: int, field_id: int, user: User, file: UploadFile =
             raise HTTPException(404, "添付ファイル項目が見つかりません")
         if not can_edit_field(a, user, f):
             raise HTTPException(403, "この項目を編集する権限がありません")
+    return await store_upload(file, app_id, field_id, user)
+
+
+async def store_upload(file: UploadFile, app_id: int, field_id: int, user: dict) -> dict:
+    """アップロードされたファイルを保存し、未紐付けの添付として登録する。"""
     stored = uuid.uuid4().hex
     path, size = upload_dir() / stored, 0
     try:
@@ -1405,10 +1607,11 @@ async def upload_file(app_id: int, field_id: int, user: User, file: UploadFile =
     with connect() as conn:
         # 保存されないまま1日以上残っている仮ファイルを掃除する
         limit = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
-        remove_files(conn, "record_id IS NULL AND created_at < ?", [limit])
+        remove_files(conn, "record_id IS NULL AND comment_id IS NULL AND created_at < ?", [limit])
         fid = conn.execute(
-            "INSERT INTO attachments (app_id, field_id, name, size, stored, created_at) "
-            "VALUES (?,?,?,?,?,?)", (app_id, field_id, name, size, stored, now())).lastrowid
+            "INSERT INTO attachments (app_id, field_id, name, size, stored, created_at, "
+            "uploaded_by) VALUES (?,?,?,?,?,?,?)",
+            (app_id, field_id, name, size, stored, now(), user["id"])).lastrowid
     return {"id": fid, "name": name, "size": size}
 
 
@@ -1418,7 +1621,10 @@ def download_file(file_id: int, user: User):
         row = conn.execute("SELECT * FROM attachments WHERE id = ?", (file_id,)).fetchone()
         # アプリや項目を閲覧できない場合も、存在を知らせないよう 404 にする
         ok = bool(row) and can_view(conn, row["app_id"], user)
-        if ok:
+        if ok and row["field_id"] == 0:
+            # コメントの添付: アプリを閲覧できれば可。投稿前の仮ファイルはアップロードした本人だけ
+            ok = row["comment_id"] is not None or row["uploaded_by"] == user["id"]
+        elif ok:
             a = get_app(conn, row["app_id"], user)
             ok = any(f["id"] == row["field_id"]
                      for f in split_fields(a, user, get_fields(conn, a["id"]))[0])

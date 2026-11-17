@@ -713,3 +713,105 @@ def test_field_edit_permissions(client, tmp_path):
     assert sato.put(url, json={"data": {title: "導入", approval: "済"}}).json()["data"][approval] == "済"
     assert sato.post(f"{base}/records", json={"data": {title: "x"}}).status_code == 422
     assert client.put(url, json={"data": {title: "導入", approval: "未"}}).json()["data"][approval] == "未"
+
+
+def test_comment_attachments(client, inquiry, tmp_path):
+    app_id, ids = inquiry
+    base = f"/api/apps/{app_id}"
+    sato = new_user(client, "sato", "佐藤")
+    rid = client.post(f"{base}/records", json={"data": {ids["件名"]: "x", ids["受付日"]: "2026-11-01", ids["状況"]: "未対応"}}).json()["id"]
+    url = f"{base}/records/{rid}"
+    up = lambda who, name, body=b"data": who.post(f"{url}/comment-files", files={"file": (name, body)})
+    stored = lambda: len(list((tmp_path / "uploads").iterdir()))
+
+    f1, f2 = up(client, "議事録.pdf").json(), up(client, "写真.png", b"png").json()
+    # 投稿前の仮ファイルは本人だけがダウンロードできる
+    assert client.get(f"/api/files/{f1['id']}").content == b"data"
+    assert sato.get(f"/api/files/{f1['id']}").status_code == 404
+    # 他人の仮ファイルや存在しないファイルは添付できない。本文も添付もないコメントは不可
+    assert sato.post(f"{url}/comments", json={"body": "x", "file_ids": [f1["id"]]}).status_code == 400
+    assert client.post(f"{url}/comments", json={"body": "x", "file_ids": [9999]}).status_code == 400
+    assert client.post(f"{url}/comments", json={"body": " ", "file_ids": []}).status_code == 400
+
+    c = client.post(f"{url}/comments", json={"body": "資料です", "file_ids": [f1["id"], f2["id"]]})
+    assert c.status_code == 201
+    assert [f["name"] for f in c.json()["files"]] == ["議事録.pdf", "写真.png"]
+    assert client.post(f"{url}/comments", json={"body": "x", "file_ids": [f1["id"]]}).status_code == 400  # 使い回し不可
+    # 本文なしでファイルだけのコメントも可
+    f3 = up(sato, "メモ.txt").json()
+    c2 = sato.post(f"{url}/comments", json={"file_ids": [f3["id"]]}).json()
+    assert c2["body"] == "" and c2["files"][0]["name"] == "メモ.txt"
+    notes = client.get("/api/notifications").json()["items"]
+    assert "（ファイルを添付）" in notes[0]["message"]
+
+    listed = client.get(f"{url}/comments").json()
+    assert [len(x["files"]) for x in listed] == [2, 1]
+    assert sato.get(f"/api/files/{f1['id']}").content == b"data"  # 投稿後はアプリを見られる人全員
+    # 閲覧のみの人は添付できない。アプリを見られない人はダウンロードできない
+    client.put(f"{base}/access", json={"default_role": "viewer", "members": []})
+    assert up(sato, "a.txt").status_code == 403
+    client.put(f"{base}/access", json={"default_role": "none", "members": []})
+    assert sato.get(f"/api/files/{f1['id']}").status_code == 404
+    client.put(f"{base}/access", json={"default_role": "editor", "members": []})
+
+    # レコード側の添付ファイル更新ではコメントの添付は消えない
+    client.put(url, json={"data": {ids["件名"]: "y", ids["受付日"]: "2026-11-01", ids["状況"]: "未対応"}})
+    assert stored() == 3
+    # コメント削除・レコード削除でファイルも消える
+    client.delete(f"{url}/comments/{c.json()['id']}")
+    assert stored() == 1 and client.get(f"/api/files/{f1['id']}").status_code == 404
+    up(client, "未投稿.txt")
+    client.delete(url)
+    assert stored() == 1  # 未投稿の仮ファイルだけが残る（1日後に自動で掃除される）
+    assert client.get(f"/api/files/{f3['id']}").status_code == 404
+
+
+def test_dashboard(client, inquiry):
+    app_id, ids = inquiry
+    base = f"/api/apps/{app_id}"
+    sato = new_user(client, "sato", "佐藤")
+    view = client.post(f"{base}/views", json={"name": "未対応", "type": "table", "config": {"columns": [int(ids["件名"])]}}).json()["id"]
+    secret = client.post(f"{base}/views", json={"name": "管理者用", "type": "calendar", "access": "restricted",
+                                                "user_ids": [], "config": {"date_field": int(ids["受付日"])}}).json()["id"]
+    w = lambda **kw: {"app_id": app_id, "x": 0, "y": 0, **kw}
+
+    # 最初は空。一般ユーザーは既定を変更できない
+    assert client.get("/api/dashboard").json() == {"cols": 5, "rows": 10, "custom": False, "widgets": []}
+    assert sato.put("/api/dashboard/default", json={"widgets": []}).status_code == 403
+    assert sato.get("/api/dashboard/default").status_code == 403
+
+    # 配置の検証: はみ出し・重なり・存在しないビュー・権限のないビュー
+    put = lambda who, widgets, url="/api/dashboard": who.put(url, json={"widgets": widgets})
+    assert put(client, [w(x=4, w=2)]).status_code == 400
+    assert put(client, [w(y=9, h=2)]).status_code == 400
+    assert put(client, [w(x=-1)]).status_code == 400
+    assert put(client, [w(w=2, h=2), w(x=1, y=1)]).status_code == 400
+    assert put(client, [w(view_id=9999)]).status_code == 400
+    assert put(client, [w(mode="chart")]).status_code == 400
+    assert put(sato, [w(view_id=secret)]).status_code == 400
+
+    # 管理者が既定を設定 → 変更していない全員に表示される。権限のないビューは省かれる
+    default = [w(view_id=view, w=3, h=2), w(view_id=secret, x=3, w=2, h=4), w(mode="calendar", y=2, w=3, h=3)]
+    r = put(client, default, "/api/dashboard/default")
+    assert r.status_code == 200 and len(r.json()["widgets"]) == 3
+    mine = sato.get("/api/dashboard").json()
+    assert mine["custom"] is False
+    assert [(x["view_name"], x["mode"]) for x in mine["widgets"]] == [("未対応", "list"), ("カレンダー（標準）", "calendar")]
+    assert mine["widgets"][0]["app_name"] == "問い合わせ"
+    assert len(client.get("/api/dashboard").json()["widgets"]) == 3  # 管理者自身も既定を使う
+
+    # 自分用に変更 → 既定を変えても影響しない。既定に戻すと既定が表示される
+    assert put(sato, [w(mode="list", x=1, y=5, w=4, h=5)]).json()["custom"] is True
+    put(client, [w(view_id=view)], "/api/dashboard/default")
+    assert [(x["x"], x["y"], x["w"], x["h"]) for x in sato.get("/api/dashboard").json()["widgets"]] == [(1, 5, 4, 5)]
+    back = sato.delete("/api/dashboard").json()
+    assert back["custom"] is False and [x["view_id"] for x in back["widgets"]] == [view]
+
+    # ビューを削除すると、配置からも自動で消える
+    client.delete(f"{base}/views/{view}")
+    assert sato.get("/api/dashboard").json()["widgets"] == []
+
+    # 置けるものの一覧: 使えるビューだけ
+    opts = sato.get("/api/dashboard/options").json()
+    assert opts == [{"app_id": app_id, "name": "問い合わせ", "icon": "📋", "has_date": True, "views": []}]
+    assert [v["name"] for v in client.get("/api/dashboard/options").json()[0]["views"]] == ["管理者用"]
